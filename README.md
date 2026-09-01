@@ -204,11 +204,6 @@ docker run --rm -d --name dvwa -p 8080:80 vulnerables/web-dvwa
 docker kill dvwa
 ```
 
-**testphp.vulnweb.com** (Acunetix public demo, authorized to test — no docker needed):
-```
-> --scope testphp.vulnweb.com http://testphp.vulnweb.com/
-```
-
 ---
 
 ## Configuration summary
