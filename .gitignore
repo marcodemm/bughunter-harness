@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local config with secrets / real targets (NEVER commit these)
+config.yaml
+scope.txt
+launch.command
+
+# Runtime output — engagement logs, findings, reports
+sessions/
+
+# macOS
+.DS_Store
+._*
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local tool outputs the agents may have missed cleaning up
+/tmp/harness-*
+nuclei_*.txt
+ffuf_*.txt
+subfinder_*.txt
+katana_*.txt
+gau_*.txt
+wayback_*.txt
+nikto_*.txt

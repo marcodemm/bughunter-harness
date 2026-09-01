@@ -1,0 +1,4 @@
+openai>=1.40
+pyyaml>=6.0
+requests>=2.31
+rich>=13.0

@@ -1,0 +1,10 @@
+# Copy to scope.txt and edit for your engagement.
+# Lines starting with # are ignored.
+# Entries:
+#   exact host      → example.com
+#   wildcard sub    → *.example.com  (matches a.example.com, a.b.example.com, etc.)
+#   CIDR            → 10.0.0.0/24
+#   exact IP        → 127.0.0.1
+
+127.0.0.1
+localhost

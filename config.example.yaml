@@ -1,0 +1,166 @@
+# ─────────── LLM backend ──────────────────────────────────────────
+# 7 OpenAI-compatible backends supported:
+#   LOCAL (auto-probed, no API key):
+#     lmstudio   http://127.0.0.1:1234/v1
+#     ollama     http://127.0.0.1:11434/v1
+#     llamacpp   http://127.0.0.1:8080/v1
+#   CLOUD (require API key + $$$; never auto-selected):
+#     openai     https://api.openai.com/v1                             OPENAI_API_KEY
+#     anthropic  https://api.anthropic.com/v1                          ANTHROPIC_API_KEY
+#     nvidia     https://integrate.api.nvidia.com/v1                   NVIDIA_API_KEY
+#     gemini     https://generativelanguage.googleapis.com/v1beta/openai  GEMINI_API_KEY
+# CLI/REPL flags override this section: --servertype, --model, --base-url.
+#
+# Cloud API key sourcing (highest wins):
+#   1. llm.api_key                     (direct value in this file)
+#   2. env var named by llm.api_key_env
+#   3. backend default env var (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
+# Missing key on a cloud servertype = harness aborts with a clear error.
+llm:
+  servertype: "auto"              # auto | lmstudio | ollama | llamacpp |
+                                  # openai | anthropic | nvidia | gemini
+  base_url: ""                    # empty → use the servertype default
+  # API key for cloud backends (leave empty for local):
+  api_key: ""                     # paste key here (less secure)
+  api_key_env: ""                 # env var name (backend default if empty)
+  model: ""                       # empty → auto-detect
+                                  # (anthropic REQUIRES an explicit model)
+
+# Legacy fields (backwards compat with pre-multi-backend versions).
+# If llm.* above is filled, those win. Left here so old configs still work.
+base_url: "http://127.0.0.1:1234/v1"
+api_key: "placeholder"
+model: ""                         # empty = auto-detect
+
+# Sampling
+temperature: 0.3
+max_response_tokens: 2048
+
+# Tool call mode
+#   auto     → model decides when to call tools (STABLE — default)
+#   required → LM Studio enforces strict PEG grammar for tool_calls; some
+#              fine-tuned models (Qwen MoE bughunter etc.) violate it and
+#              crash LM Studio with "peg-native format" errors. The harness
+#              will auto-fallback to "auto" on failure, but "auto" from the
+#              start is more reliable.
+tool_choice: "auto"
+
+# Kill switches (defense in depth)
+max_iterations: 40           # max LLM turns per session
+max_wall_time_sec: 1800      # 30 minutes
+
+# Rate limit — enforced at the tool layer for EVERY http_get/http_post/run_shell.
+# Model cannot bypass. Use 1.0 (1 req/s) as baseline; raise only for lab targets.
+min_request_interval_sec: 1.0
+
+# Per-tool timeouts (seconds). Raise if nuclei/nmap with many templates keeps
+# hitting the timeout; lower if you want the agent to try faster fallbacks.
+shell_timeout_sec: 300     # bash commands (nuclei, nmap, ffuf, ...) — 5 min
+http_timeout_sec: 30       # single http_get / http_post — 30 s
+
+# Wipe /tmp/harness-*, /tmp/gau_*, /tmp/nuclei_* … after report or on exit.
+# Only touches patterns our agents write; leaves unrelated tempfiles alone.
+cleanup_tempfiles: true
+
+# Notifications gate. When true (default), email + Telegram only send when
+# the run produced at least one finding of medium/high/critical severity.
+# Set to false to always notify (useful for debugging the pipeline).
+notify_only_if_findings: true
+
+# Custom HTTP headers auto-injected on every http_get / http_post request.
+# The model is also told to add these via -H "..." on curl/nuclei/ffuf/httpx/
+# katana shell commands. Useful for researcher-attribution so the target's
+# security team can identify traffic as authorized research.
+# Overridable per-session in the REPL:  --header "Name: value"  (repeatable)
+#
+# Two ways to configure:
+#   (a) No headers — leave as empty dict:
+#         custom_headers: {}
+#   (b) One or more headers (block-style, recommended for readability):
+#         custom_headers:
+#           X-HackerOne-Researcher: yourhandle
+#           X-Bugcrowd-Researcher:  yourhandle
+#           X-Bug-Bounty:           research
+#
+# Default: no custom headers.
+custom_headers: {}
+
+# In-scope allowlist file (one host/wildcard/CIDR per line)
+scope_file: "scope.txt"
+
+# Scope enforcement mode
+#   strict  → reject requests outside scope.txt (SAFE — default)
+#   warn    → allow but log a warning on every off-scope request
+#   off     → do not validate scope (FREE — only for authorized exploration)
+# Warning: warn/off disable the last line of defence. Use only for engagements
+# without a scope list, or when the operator supervises manually.
+scope_enforcement: "strict"
+
+# OOB catcher — used by tool oob_generate_token
+# Set to your self-hosted domain; NEVER third-party services.
+# Leave empty to disable the tool.
+oob_host: ""                 # e.g. "oob.example.com"
+oob_token_prefix: "harness"  # tokens will be <prefix>-<vector>-<label>
+
+# Telegram notification at end of pipeline (sends executive summary +
+# REPORT.md file). Setup:
+#   1. Talk to @BotFather in Telegram → /newbot → save the bot token
+#   2. Start a chat with your bot (send it /start or any message)
+#   3. curl https://api.telegram.org/bot<TOKEN>/getUpdates
+#      → find "chat":{"id":<CHAT_ID>,...}
+#   4. Export the token as an env var, never store it in this YAML:
+#        export TELEGRAM_BOT_TOKEN='123456:ABC-DEF...'
+#   5. Put the chat_id here (or export $TELEGRAM_CHAT_ID as fallback)
+#
+# Override chat_id per session via CLI/REPL:  --telegram <CHAT_ID>
+telegram:
+  enabled: false
+  # Two ways to provide the bot token — direct value wins:
+  bot_token: ""                          # paste token here (less secure)
+  bot_token_env: "TELEGRAM_BOT_TOKEN"    # OR set this env var (recommended)
+  chat_id: ""                            # numeric or -100... for groups
+  chat_id_env: "TELEGRAM_CHAT_ID"        # fallback env var
+  send_summary_text: true                # executive summary as text message
+  send_report_file: true                 # REPORT.md as document attachment
+
+# SMTP config for --email flag (end-of-session report).
+#
+# Two modes, auto-selected:
+#   AUTH mode : host AND username both set   → uses password from env var
+#   LOCAL mode: host or username empty       → connects to 127.0.0.1:25 (or
+#                                              host:port if partially set),
+#                                              NO auth, NO TLS. Requires a
+#                                              local MTA listening.
+#
+# AUTH example (Gmail — password_env = SMTP_PASSWORD, App Password required):
+#   export SMTP_PASSWORD='xxxx xxxx xxxx xxxx'
+#   smtp:
+#     host: "smtp.gmail.com"
+#     port: 587
+#     from: "you@example.com"
+#     username: "you@example.com"
+#     password_env: "SMTP_PASSWORD"
+#     use_ssl: false
+#
+# LOCAL example (Mailpit dev inbox on macOS: `brew install mailpit && mailpit`):
+#   smtp:
+#     host: "127.0.0.1"
+#     port: 1025
+#     from: "harness@localhost"
+#     username: ""             # empty → local mode
+#
+# Leave the whole `smtp:` block out (or fields empty) for local-mode default
+# at 127.0.0.1:25.
+smtp:
+  host: ""                   # empty → local relay at 127.0.0.1
+  port: 25
+  from: ""                   # empty → auto: harness@<hostname>
+  username: ""               # empty → no auth (local mode)
+  # Two ways to provide the SMTP password — direct value wins:
+  password: ""               # paste password here (less secure)
+  password_env: "SMTP_PASSWORD"  # OR set this env var (recommended)
+  use_ssl: false             # false=STARTTLS(587) · true=SSL direct(465)
+  # Default recipient. If set, email auto-sends at end of pipeline WITHOUT
+  # needing --email on the CLI. Overridable with --email <addr>. Leave
+  # empty to require the flag explicitly.
+  default_to: ""             # e.g. "me@example.com"
