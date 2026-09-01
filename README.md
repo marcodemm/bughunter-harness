@@ -37,6 +37,27 @@ The harness auto-probes local backends in this order. Also accepts cloud provide
 
 **Recommended for privacy + zero cost**: run any 7B–35B model locally in LM Studio or Ollama. Cloud backends work fine but you pay per token and traffic leaves your machine.
 
+**⭐ Recommended model for this harness — `Qwen3.5-35B-A3B-uncensored-bughunter-v8`**
+([mmp2055/Qwen3.5-35B-A3B-uncensored-bughunter-v8 on Hugging Face](https://huggingface.co/mmp2055/Qwen3.5-35B-A3B-uncensored-bughunter-v8)).
+A Qwen 3.5 35B MoE (3B active params) fine-tuned specifically for bug-bounty /
+offensive-security workflows: prefers concrete tool calls over hand-wavy prose,
+knows nuclei / ffuf / sqlmap / dalfox / gau / katana / dnsx flags without
+hand-holding, and doesn't refuse lab-only default-cred probes on DVWA / Juice
+Shop / Mutillidae. Runs comfortably on a single Mac (Apple Silicon,
+≥ 32 GB RAM) via LM Studio. The default `llm.model` in
+[`config.example.yaml`](config.example.yaml) is pinned to this model — change
+it if you prefer a different backend.
+
+Setup with LM Studio (fastest path):
+
+1. Install LM Studio → https://lmstudio.ai
+2. Search & download **`mmp2055/Qwen3.5-35B-A3B-uncensored-bughunter-v8`** (~19 GB Q4_K_M).
+3. In LM Studio → *Developer* → *Local Server* → **Start Server** on port 1234.
+4. Turn **OFF Speculative Decoding** in the model's *Settings* (Qwen 3.5 MoE
+   fails to load with MTP on).
+5. Enable **Tool Use** in the model's *Settings* (required for the agent
+   pipeline).
+
 ### 4. Offensive tools (nuclei / ffuf / etc.)
 
 The agents run these binaries via `run_shell`. Install what you plan to use — nothing is required, but with more tools installed the harness discovers more.

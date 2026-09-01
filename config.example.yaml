@@ -23,7 +23,19 @@ llm:
   # API key for cloud backends (leave empty for local):
   api_key: ""                     # paste key here (less secure)
   api_key_env: ""                 # env var name (backend default if empty)
-  model: ""                       # empty → auto-detect
+  # Recommended model (fine-tuned specifically for bug-bounty / offensive-sec
+  # workflows — knows nuclei/ffuf/sqlmap/dalfox flags out of the box and does
+  # NOT refuse lab-only default-cred probes on DVWA / Juice Shop / Mutillidae):
+  #
+  #   https://huggingface.co/mmp2055/Qwen3.5-35B-A3B-uncensored-bughunter-v8
+  #
+  # Runs comfortably on Apple Silicon with ≥ 32 GB RAM via LM Studio.
+  # In LM Studio: Speculative Decoding OFF (MTP crashes this model on load),
+  # Tool Use ON. Then start the local server on 127.0.0.1:1234.
+  #
+  # Set the model id EXACTLY as LM Studio / Ollama expose it (lowercase, dashes).
+  # Leave empty ONLY if you want the harness to pick whichever model is loaded.
+  model: "qwen3.5-35b-a3b-uncensored-bughunter-v8"
                                   # (anthropic REQUIRES an explicit model)
 
 # Legacy fields (backwards compat with pre-multi-backend versions).
