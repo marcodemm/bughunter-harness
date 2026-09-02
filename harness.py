@@ -586,8 +586,14 @@ MULTI-HOST MODE  (loop scan over ranked subdomains)
   --scope "*.example.com" you'd miss admin.example.com / dev.example.com /
   api.example.com etc.
 
-  Enable multi-host with --multi-host (per run) or multi_host.enabled=true
-  in config.yaml. In multi-host mode the pipeline is split into 3 phases:
+  Auto-activation:
+    * If ANY --scope pattern starts with '*.' (a wildcard), multi-host
+      is AUTO-ENABLED for that run — you almost always want it in that
+      case. Pass --single-host to override the auto-enable.
+    * Otherwise: opt in with --multi-host (per run) or with
+      multi_host.enabled=true in config.yaml.
+
+  In multi-host mode the pipeline is split into 3 phases:
 
     PHASE 1 (once):        recon → sub_prioritizer → (any non-repeated agent)
     PHASE 2 (once/sub):    fingerprint → content_discovery → login_probe →
@@ -1414,10 +1420,25 @@ def main():
         if session_adversarial_model:
             adv_run["model"] = session_adversarial_model
         cfg_run["adversarial_review"] = adv_run
-        # Multi-host overrides
+        # Multi-host overrides — precedence:
+        #   1) --single-host / --multi-host CLI (explicit)  → wins
+        #   2) config.yaml → multi_host.enabled: true       → ON
+        #   3) any --scope *.<domain> wildcard pattern      → AUTO-ON
+        #   4) default                                       → OFF
         mh_run = dict(cfg.get("multi_host") or {})
         if session_multi_host is not None:
             mh_run["enabled"] = bool(session_multi_host)
+        elif not mh_run.get("enabled"):
+            # No explicit CLI decision AND config didn't turn it on:
+            # auto-enable when scope has a wildcard pattern (multi-host
+            # is obviously what the operator wants for `*.example.com`).
+            wildcards = [p for p in (session_scope or [])
+                          if str(p).startswith("*.")]
+            if wildcards:
+                mh_run["enabled"] = True
+                print(f"[+] Multi-host AUTO-enabled "
+                      f"(wildcard scope: {wildcards}) — pass --single-host "
+                      "to override.")
         if session_top_hosts is not None:
             mh_run["top_n"] = int(session_top_hosts)
         cfg_run["multi_host"] = mh_run

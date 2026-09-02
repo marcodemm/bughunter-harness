@@ -129,8 +129,14 @@ adversarial_review:
 #   --multi-host          → force enabled=true for this run
 #   --single-host         → force enabled=false for this run
 #   --top-hosts N         → override top_n
+#
+# AUTO-ENABLE rule: if ANY --scope pattern starts with '*.' (a wildcard,
+# e.g. --scope '*.example.com'), multi-host is AUTO-ENABLED for that
+# run regardless of the `enabled` value below — you almost always want
+# it in that case. Pass --single-host to override the auto-enable.
 multi_host:
   enabled: false               # default off (single-host = fastest single-run)
+                               # — auto-flipped to ON if scope has *.<domain>
   top_n: 3                     # scan top-3 prioritized subs
   min_score: 30                # only include subs with score >= 30
                                # (falls back to top_n if nothing meets it)

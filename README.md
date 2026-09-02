@@ -257,7 +257,9 @@ See `config.example.yaml` inline comments for every field.
 
 Default is single-host: the pipeline scans `state.live_hosts[0]` only. That's fine when your target is one URL, but on wildcard targets like `--scope "*.example.com"` you'd miss `admin.example.com` / `dev.example.com` / `api.example.com` etc.
 
-**Enable multi-host** with `--multi-host` (per run) or `multi_host.enabled: true` in `config.yaml`. The pipeline splits into 3 phases:
+**Auto-activation**: if any `--scope` pattern starts with `*.` (a wildcard, e.g. `--scope '*.example.com'`), multi-host is **auto-enabled** for that run — it's almost always what you want on a wildcard target. Override with `--single-host` if you specifically want to scan only the primary URL.
+
+**Enable multi-host manually** with `--multi-host` (per run) or `multi_host.enabled: true` in `config.yaml`. The pipeline splits into 3 phases:
 
 - **Phase 1** (once): `recon → sub_prioritizer` (+ any non-repeated agent, e.g. an extension like `takeover`).
 - **Phase 2** (once per top-N sub): `fingerprint → content_discovery → login_probe → web_vuln → wordpress → api_fuzzer → auth`.
