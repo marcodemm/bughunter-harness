@@ -186,6 +186,8 @@ Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH
 > http://localhost:3000/
 ```
 
+![Bughunter Harness command-line interface](images/application-command-line-interface.png)
+
 The orchestrator will run the 9 agents in sequence and produce a `sessions/<run-id>/REPORT.md` at the end.
 
 **Pipeline (order matters — cookies from step 4 feed into step 5):**
