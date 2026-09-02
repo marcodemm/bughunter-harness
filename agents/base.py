@@ -173,6 +173,36 @@ class BaseAgent:
         self.finish_summary: str | None = None
         self.finish_findings: list[str] = []
 
+    # ── extension-technique injection ───────────────────────────────
+    def _extension_techniques_block(self, state) -> str:
+        """Load techniques whose frontmatter matches current context and
+        render them as a system-prompt block. Returns '' if none or on any
+        error (extension loading NEVER breaks a run)."""
+        try:
+            import extension_loader
+            from pathlib import Path as _P
+            ext_cfg = self.cfg.get("extensions") or {}
+            if not ext_cfg.get("enabled", True):
+                return ""
+            dirs = [_P(__file__).resolve().parent.parent / "extensions"]
+            for extra in ext_cfg.get("extra_dirs") or []:
+                p = _P(extra).expanduser()
+                if p.is_dir():
+                    dirs.append(p)
+            all_techs: list[dict] = []
+            for d in dirs:
+                all_techs.extend(extension_loader.discover_techniques(d))
+            if not all_techs:
+                return ""
+            detected = state.get("detected_techs", []) or []
+            endpoints = [e.get("url", "")
+                         for e in (state.get("endpoints_found", []) or [])]
+            applicable = extension_loader.techniques_applicable_for(
+                all_techs, self.NAME, detected, endpoints)
+            return extension_loader.render_techniques_for_prompt(applicable)
+        except Exception:
+            return ""
+
     # ── overridable ─────────────────────────────────────────────────
     def entry_condition(self, state) -> bool:
         return True
@@ -255,11 +285,26 @@ class BaseAgent:
         # get them auto-injected by the harness.
         headers_reminder = _headers_reminder(
             self.tool_registry.custom_headers)
+        # Extension tools/techniques — inject prompt hints so the model
+        # knows the extended toolbox available in run_shell + any playbooks
+        # that match the current target context.
+        ext_tools_hint = ""
+        ext_techniques_block = ""
+        try:
+            ext_tools_hint = self.tool_registry.extension_tools_prompt_hint()
+        except AttributeError:
+            pass
+        try:
+            ext_techniques_block = self._extension_techniques_block(state)
+        except Exception:
+            pass
         messages = [
             {"role": "system",
              "content": (self.SYSTEM_PROMPT
                          + FINISH_FORMAT_REMINDER
-                         + headers_reminder)},
+                         + headers_reminder
+                         + ext_tools_hint
+                         + ext_techniques_block)},
             {"role": "user", "content": objective},
         ]
         tools = self._filtered_tool_schemas()

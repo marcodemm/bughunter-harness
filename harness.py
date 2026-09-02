@@ -421,7 +421,7 @@ class Harness:
 
 HELP_TEXT = r"""
 ════════════════════════════════════════════════════════════════════
- BUGBOUNTY HARNESS · Autonomous local LLM agent
+ BUGHUNTER HARNESS · Autonomous local LLM agent
  Model: qwen3.5-35b-a3b-uncensored-bughunter-v8 (LM Studio)
 ════════════════════════════════════════════════════════════════════
 
@@ -438,6 +438,8 @@ USAGE
                                                  anthropic|nvidia|gemini)
   python harness.py --model qwen3:8b         → LLM model id (auto if omitted)
   python harness.py --base-url URL           → custom OpenAI-compatible URL
+  python harness.py --no-adversarial         → skip post-pipeline finding review
+  python harness.py --adversarial-model M    → different model for the reviewer
   python harness.py --legacy                 → single-agent classic loop
   python harness.py --skip-preflight         → do not check target liveness first
   python harness.py --one-shot               → single run then exit
@@ -465,6 +467,9 @@ REPL COMMANDS
     --servertype {auto,lmstudio,ollama,llamacpp,openai,anthropic,nvidia,gemini}
     --model MODEL_ID                 LLM model id (auto-detect if empty)
     --base-url URL                   OpenAI-compatible endpoint override
+    --no-adversarial                 disable post-pipeline finding reviewer
+    --adversarial-model MODEL_ID     override reviewer model (default: same
+                                     as --model)
     -o PATH                          session log destination
   Pass an empty value to clear a sticky:  --header ""    --scope ""    --email ""
 
@@ -510,11 +515,15 @@ ORCHESTRATED PIPELINE (default mode)
     1. recon              subdomains, DNS, live hosts, open ports    (always)
     2. fingerprint        deep tech-stack detection                  (if live)
     3. content_discovery  dir/file brute-force + historical URLs     (if live)
-    4. web_vuln           nuclei + nikto scan per detected tech      (if live)
-    5. wordpress          wpscan + WP-specific CVEs                  (if WP)
-    6. api_fuzzer         API/GraphQL surface + BOLA/BFLA hints      (if /api)
-    7. auth               auth-bypass, SSO/OAuth misconfig checks    (if login)
-    8. report             consolidated Markdown report               (always)
+    4. login_probe        lab-only default-creds → session_cookies   (if lab)
+    5. web_vuln           nuclei + nikto + sqlmap + dalfox scan      (if live)
+    6. wordpress          wpscan + WP-specific CVEs                  (if WP)
+    7. api_fuzzer         API/GraphQL surface + BOLA/BFLA hints      (if /api)
+    8. auth               auth-bypass, SSO/OAuth misconfig checks    (if login)
+    9. report             consolidated Markdown report               (always)
+
+  Any agents dropped in extensions/agents/ are spliced automatically according
+  to their ENTRY_AFTER class attribute (see EXTENSIONS section below).
 
   Each agent writes its own JSONL to sessions/<run-id>/agents/<name>.jsonl,
   and the run's shared_state at sessions/<run-id>/state.json. Final report:
@@ -526,13 +535,17 @@ ORCHESTRATED PIPELINE (default mode)
   --legacy switches back to the single-agent classic loop (for debugging).
 
 TOOLS AVAILABLE TO THE AGENT
-  http_get             GET request, throttled + in-scope
-  http_post            POST request, throttled + in-scope
+  http_get             GET request, throttled + in-scope. Auto-injects the
+                       session cookie captured by login_probe (if any) plus
+                       any custom_headers.
+  http_post            POST request, throttled + in-scope (same auto-injection).
   run_shell            command line with pipes/redirects allowed. Each stage's
                        first token must be in the allowlist:
                          offensive: nmap nuclei nikto ffuf feroxbuster wpscan
                                     curl dig host whois httpx subfinder dnsx
                                     naabu gau waybackurls katana
+                                    sqlmap dalfox
+                                    + any binaries declared in extensions/tools/
                          helpers  : ls cat head tail wc sort uniq grep egrep
                                     fgrep awk cut tr sed tee xargs find which
                                     file echo base64 jq yq
@@ -560,6 +573,58 @@ CUSTOM HTTP HEADERS  (researcher attribution)
   nikto / wpscan / feroxbuster shell commands.
 
   Clear all with an empty value:  --header ""
+
+ADVERSARIAL REVIEW  (post-pipeline finding gate)
+  After the report agent runs, an adversarial reviewer sends each finding
+  above `min_severity` (default: medium) to an LLM with a strict 7-question
+  gate — specific / demonstrable / severity-matches-evidence / triager-
+  reproducible / in-scope / program-payable / not-a-known-duplicate. Only
+  findings that pass ALL 7 stay in `state.findings`; the rest move to
+  `state.rejected_findings` and are hidden from email/Telegram notifications
+  (still visible in REPORT.md's "Adversarial Review" section).
+
+  Guardrails against runaway cost:
+    * min_severity: "medium"   → info/low never go through review
+    * max_findings: 20         → cap per run
+    * temperature: 0.1, max_tokens: 200 → each review is ~1 second
+
+  By default the reviewer reuses the SAME model as the main pipeline — one
+  LM Studio slot is enough. Set adversarial_review.model (or --adversarial-
+  model MODEL_ID) to a DIFFERENT model to run e.g. local Qwen for agents +
+  cloud Sonnet for the review.
+
+  Disable entirely with --no-adversarial (per-run) or
+  adversarial_review.enabled=false in config.yaml (permanent).
+
+  Reviewer errors are FAIL-OPEN: if the LLM is down, findings pass through
+  ungated rather than getting silently lost.
+
+EXTENSIONS  (drop-in agents / tools / techniques)
+  The harness auto-discovers plugins under `extensions/` at startup:
+
+    extensions/agents/*.py      → any subclass of BaseAgent is spliced into
+                                   the pipeline. Position is controlled by
+                                   the class attribute ENTRY_AFTER = "recon"
+                                   (or any other agent NAME). If not set,
+                                   the agent runs right before `report`.
+    extensions/tools/*.yaml     → adds a binary to the run_shell allowlist,
+                                   with install_hint and prompt_hint that
+                                   gets injected into agents' system prompts.
+                                   Fields: binary (required), install_hint,
+                                   prompt_hint, output_parser, finding_template.
+    extensions/techniques/*.md  → knowledge base with YAML frontmatter.
+                                   Loaded into an agent's prompt ONLY when
+                                   the current context matches applies_when
+                                   (detected_techs, endpoints_match). Same
+                                   format as bug-bounty technique write-ups.
+
+  Extensions are pure additions: they never modify or shadow core behaviour.
+  A malformed extension is logged and skipped — it can never crash the
+  pipeline. See EXTENDING.md in the harness root for full guidance with a
+  minimal working example for each of the three types.
+
+  Toggle in config.yaml → extensions.enabled (default: true) and add extra
+  directories via extensions.extra_dirs: ["/opt/shared", "~/my-plugins"].
 
 PRE-FLIGHT REACHABILITY CHECK
   Before spawning any agent, the orchestrator sends a single HTTP GET to the
@@ -867,6 +932,17 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
         if t.startswith("--base-url="):
             overrides["base_url"] = t.split("=", 1)[1]
             i += 1; continue
+        # --no-adversarial : disable the adversarial reviewer for THIS run
+        if t == "--no-adversarial":
+            overrides["no_adversarial"] = True
+            i += 1; continue
+        # --adversarial-model MODEL_ID : override the reviewer's model
+        if t == "--adversarial-model" and i + 1 < len(tokens):
+            overrides["adversarial_model"] = tokens[i + 1]
+            i += 2; continue
+        if t.startswith("--adversarial-model="):
+            overrides["adversarial_model"] = t.split("=", 1)[1]
+            i += 1; continue
         remaining.append(t)
         i += 1
     return " ".join(remaining), overrides
@@ -1080,6 +1156,22 @@ def main():
                          "headers / IP allowlisting that only the agents "
                          "would satisfy. Without this flag the orchestrator "
                          "aborts if the target does not respond within 10s.")
+    ap.add_argument("--no-adversarial", action="store_true",
+                    help="Disable the post-pipeline adversarial reviewer for "
+                         "this run. Findings are NOT gated — every finding "
+                         "reaches email/Telegram as-is. Use for fast runs "
+                         "when you'll triage manually. Same as setting "
+                         "adversarial_review.enabled=false in config.yaml.")
+    ap.add_argument("--adversarial-model", dest="adversarial_model",
+                    metavar="MODEL_ID",
+                    help="Override the model used by the adversarial "
+                         "reviewer for this run. Default = same model as "
+                         "--model / llm.model (i.e. one LM Studio slot is "
+                         "enough). Pass a DIFFERENT id (or use with a "
+                         "different servertype/base_url in config.yaml) if "
+                         "you want e.g. local Qwen for agents + cloud "
+                         "Sonnet for the review. Overrides "
+                         "config.yaml → adversarial_review.model.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -1107,6 +1199,9 @@ def main():
     session_servertype: str | None = args.servertype
     session_model: str | None = args.model
     session_base_url: str | None = args.base_url
+    # Adversarial reviewer sticky overrides
+    session_no_adversarial: bool = bool(args.no_adversarial)
+    session_adversarial_model: str | None = args.adversarial_model
     pending_objective = args.objective  # first-turn seed from CLI, if any
     is_first = True
 
@@ -1185,6 +1280,17 @@ def main():
             session_base_url = v
             print(f"[+] base_url set (sticky): {v}"
                   if v else "[+] base_url cleared (backend default).")
+        if "no_adversarial" in overrides:
+            session_no_adversarial = bool(overrides["no_adversarial"])
+            print(f"[+] Adversarial reviewer "
+                  f"{'DISABLED' if session_no_adversarial else 'ENABLED'} "
+                  "(sticky).")
+        if "adversarial_model" in overrides:
+            v = overrides["adversarial_model"] or None
+            session_adversarial_model = v
+            print(f"[+] Adversarial reviewer model set (sticky): {v}"
+                  if v else "[+] Adversarial reviewer model cleared "
+                            "(reuses main llm.model).")
 
         # 3. If line was just flags (no objective text), re-prompt without exiting
         if not objective:
@@ -1205,6 +1311,13 @@ def main():
         if session_base_url:
             llm_run["base_url"] = session_base_url
         cfg_run["llm"] = llm_run
+        # Adversarial reviewer overrides: sticky CLI/REPL wins over config
+        adv_run = dict(cfg.get("adversarial_review") or {})
+        if session_no_adversarial:
+            adv_run["enabled"] = False
+        if session_adversarial_model:
+            adv_run["model"] = session_adversarial_model
+        cfg_run["adversarial_review"] = adv_run
         # Resolve + print banner so the operator sees which backend/model runs.
         # Catch config errors (e.g. cloud without API key) so we don't leak
         # tracebacks and can re-prompt the user in the REPL.

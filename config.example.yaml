@@ -23,19 +23,7 @@ llm:
   # API key for cloud backends (leave empty for local):
   api_key: ""                     # paste key here (less secure)
   api_key_env: ""                 # env var name (backend default if empty)
-  # Recommended model (fine-tuned specifically for bug-bounty / offensive-sec
-  # workflows — knows nuclei/ffuf/sqlmap/dalfox flags out of the box and does
-  # NOT refuse lab-only default-cred probes on DVWA / Juice Shop / Mutillidae):
-  #
-  #   https://huggingface.co/mmp2055/Qwen3.5-35B-A3B-uncensored-bughunter-v8
-  #
-  # Runs comfortably on Apple Silicon with ≥ 32 GB RAM via LM Studio.
-  # In LM Studio: Speculative Decoding OFF (MTP crashes this model on load),
-  # Tool Use ON. Then start the local server on 127.0.0.1:1234.
-  #
-  # Set the model id EXACTLY as LM Studio / Ollama expose it (lowercase, dashes).
-  # Leave empty ONLY if you want the harness to pick whichever model is loaded.
-  model: "qwen3.5-35b-a3b-uncensored-bughunter-v8"
+  model: ""                       # empty → auto-detect
                                   # (anthropic REQUIRES an explicit model)
 
 # Legacy fields (backwards compat with pre-multi-backend versions).
@@ -78,6 +66,66 @@ cleanup_tempfiles: true
 # the run produced at least one finding of medium/high/critical severity.
 # Set to false to always notify (useful for debugging the pipeline).
 notify_only_if_findings: true
+
+# ─────────── Adversarial review (post-pipeline gate) ───────────────
+# After the report agent finishes, each finding whose severity is >=
+# min_severity is sent to an LLM for adversarial verification. Findings
+# that come back REJECT are moved out of state.findings into
+# state.rejected_findings (still visible in REPORT.md but suppressed from
+# email/Telegram notifications).
+#
+# Applies a strict 7-question gate by default (specific endpoint? concrete
+# impact? severity matches evidence? triager-reproducible? in-scope? would
+# the program pay? not a known-duplicate class?). Only findings that pass
+# ALL 7 survive.
+#
+# Cost: ONE LLM call per eligible finding, max_tokens=200, temperature=0.1.
+# With the default min_severity=medium a typical run adds seconds, not
+# minutes. Disable with `enabled: false` OR CLI --no-adversarial for the
+# fastest possible runs (e.g. quick recon-only against many targets).
+#
+# By default reuses the SAME model/backend as llm.* — works fine on a
+# single-slot LM Studio. Override servertype/base_url/api_key/model here
+# if you want a different reviewer (e.g. local Qwen for agents, cloud
+# Sonnet for review).
+adversarial_review:
+  enabled: true                # true | false — hard toggle
+  min_severity: "medium"       # info | low | medium | high | critical
+  max_findings: 20             # cap so a 200-finding run doesn't cost 200 calls
+  reject_action: "hide"        # "hide" → move to rejected_findings
+                               # "flag" → keep in findings, mark with verdict
+  # Reviewer LLM overrides — leave EMPTY to reuse the main llm.* backend.
+  servertype: ""               # "" | lmstudio | ollama | ... | anthropic | ...
+  base_url: ""
+  api_key: ""
+  api_key_env: ""
+  model: ""                    # "" = same model as llm.model (Bughunter v8 default)
+  # Prompt template: "default" applies the built-in 7-question gate,
+  # or set to the path of your own .md file with a custom rubric.
+  prompt_template: "default"
+
+# ─────────── Extension framework (drop-in add-ons) ─────────────────
+# The harness auto-discovers plugins under extensions/ at startup:
+#   extensions/agents/*.py       → BaseAgent subclasses inserted into the
+#                                   pipeline (position controlled by each
+#                                   agent's ENTRY_AFTER class attribute)
+#   extensions/tools/*.yaml      → binaries added to the shell allowlist,
+#                                   with prompt_hint injected into agents'
+#                                   system prompts so the model knows to use them
+#   extensions/techniques/*.md   → knowledge base with YAML frontmatter,
+#                                   loaded into an agent's prompt when the
+#                                   target context matches the technique's
+#                                   `applies_when` rules
+#
+# See EXTENDING.md for the full guide + minimal examples of each type.
+# Extensions are pure additions: they never modify core behavior; a
+# malformed extension is logged and skipped, never crashes the pipeline.
+extensions:
+  enabled: true                # false → skip extension discovery entirely
+  # Optional: additional lookup directories (comma-separated, absolute or
+  # relative to the harness root). Extensions in the built-in `extensions/`
+  # directory are ALWAYS loaded when enabled=true.
+  extra_dirs: []               # e.g. ["/opt/shared-extensions", "~/my-plugins"]
 
 # Custom HTTP headers auto-injected on every http_get / http_post request.
 # The model is also told to add these via -H "..." on curl/nuclei/ffuf/httpx/

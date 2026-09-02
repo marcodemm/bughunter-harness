@@ -141,6 +141,37 @@ class ToolRegistry:
         # SharedState — attached by orchestrator after init so we can
         # auto-inject session cookies captured by login_probe agent.
         self.state = None
+        # Extension tools — discovered by extension_loader.discover_tools()
+        # at ToolRegistry construction. Adds binaries to SHELL_ALLOWLIST and
+        # exposes prompt hints to agents via extension_tools_prompt_hint().
+        self.extension_tools: list[dict] = []
+        try:
+            import extension_loader
+            from pathlib import Path as _P
+            ext_cfg = cfg.get("extensions") or {}
+            if ext_cfg.get("enabled", True):
+                dirs = [_P(__file__).resolve().parent / "extensions"]
+                for extra in ext_cfg.get("extra_dirs") or []:
+                    p = _P(extra).expanduser()
+                    if p.is_dir():
+                        dirs.append(p)
+                for d in dirs:
+                    for spec in extension_loader.discover_tools(d):
+                        self.extension_tools.append(spec)
+                        SHELL_ALLOWLIST.add(str(spec.get("binary", "")))
+        except Exception as _e:
+            print(f"[!] extension tools load skipped: "
+                  f"{type(_e).__name__}: {_e}")
+
+    def extension_tools_prompt_hint(self) -> str:
+        """Return the combined `prompt_hint` block for all extension tools —
+        used by agents to know how to invoke them via run_shell."""
+        try:
+            import extension_loader
+            return extension_loader.render_tools_hint_for_prompt(
+                self.extension_tools)
+        except Exception:
+            return ""
         # Custom headers auto-injected on every http_get / http_post.
         # Normalized to dict[str,str], skipping empty values.
         raw = cfg.get("custom_headers") or {}

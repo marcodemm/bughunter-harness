@@ -2,7 +2,7 @@
 
 ![Bughunter Harness — a run that found a vulnerability](images/bughunter-harness-found-vuln.png)
 
-Autonomous local-LLM pentest agent. Multi-agent orchestrated pipeline (recon → fingerprint → content discovery → **login probe (lab only)** → web vuln scan (+ sqlmap + dalfox on parameterized endpoints) → wordpress → api fuzzer → auth → report) driven by any OpenAI-compatible LLM (LM Studio, Ollama, Llama.cpp, or a cloud provider). Rate-limited, scope-gated, redacted-by-default. Attribution headers, email + Telegram notifications, temp-file cleanup, and a live progress panel.
+Autonomous local-LLM pentest agent. Multi-agent orchestrated pipeline (recon → fingerprint → content discovery → **login probe (lab only)** → web vuln scan (+ sqlmap + dalfox on parameterized endpoints) → wordpress → api fuzzer → auth → report → **adversarial review**) driven by any OpenAI-compatible LLM (LM Studio, Ollama, Llama.cpp, or a cloud provider). Rate-limited, scope-gated, redacted-by-default. Attribution headers, email + Telegram notifications, temp-file cleanup, and a live progress panel. **Drop-in extension framework** (`extensions/agents/*.py`, `extensions/tools/*.yaml`, `extensions/techniques/*.md`) — add a new pipeline stage, a new binary or a new playbook without touching core code.
 
 **Design goals** — safe by default (rate limit, scope allowlist, redact secrets, no destructive commands), model-agnostic, plug-and-play with the arsenal you already have on your machine.
 
@@ -243,8 +243,60 @@ Everything lives in `config.yaml`. Key sections:
 | `telegram.*` | Telegram bot token + chat_id |
 | `notify_only_if_findings` | Only send email + Telegram if run produced findings |
 | `cleanup_tempfiles` | Wipe `/tmp/harness-*` etc. after each run |
+| `adversarial_review.*` | Post-pipeline finding gate (see "Adversarial review" above) |
+| `extensions.*` | Drop-in extension framework toggle + extra_dirs (see "Extending" above) |
 
 See `config.example.yaml` inline comments for every field.
+
+---
+
+## Adversarial review (post-pipeline finding gate)
+
+After the report agent runs, every finding whose severity is ≥ `min_severity` (default `medium`) is sent to an LLM with a strict **7-question gate**:
+
+1. Is there a **specific** endpoint / parameter / asset named?
+2. Is the impact **concrete and demonstrable**?
+3. Does the claimed severity **match the evidence**?
+4. Would a triager **reproduce** this with only the evidence given?
+5. Is it **in-scope** (not an informative-only issue class)?
+6. Would the program **actually pay** for it?
+7. Is it **not a known-duplicate class** (missing security headers alone, SPF/DMARC, EXIF, server-banner disclosure)?
+
+Findings that fail even one question are moved out of the notification path — they still appear in the `Adversarial Review` section of `REPORT.md` with the reason, so nothing is lost, but only signal reaches your inbox.
+
+**Cost**: one LLM call per eligible finding, `max_tokens=200`, `temperature=0.1` → seconds per run in the typical case. Extra guardrails: `min_severity` filter, `max_findings: 20` cap, `--no-adversarial` per-run kill switch.
+
+**Reviewer model**: by default the SAME model as the main pipeline (single LM Studio slot is enough). Override `adversarial_review.model` (or `--adversarial-model MODEL_ID`) to use a different backend for the review — e.g. local Qwen for the agents and cloud Sonnet for the reviewer.
+
+**Fail-open**: if the reviewer LLM is down, findings pass through ungated rather than get silently lost.
+
+Configure in [`config.example.yaml`](config.example.yaml) → `adversarial_review:` section. Disable with `enabled: false` or CLI `--no-adversarial`.
+
+---
+
+## Extending — drop-in agents / tools / techniques
+
+Bughunter Harness ships with a three-slot extension framework. Drop a file into `extensions/`, restart the harness, and it is live. No core changes, no plugin registration, no rebuild.
+
+```
+extensions/
+├── agents/                             (1) new agents in the pipeline
+│   └── example_takeover.py             minimum working example
+├── tools/                              (2) new binaries in the shell allowlist
+│   └── example_subjack.yaml            binary + install_hint + prompt_hint
+└── techniques/                         (3) knowledge base loaded by context
+    └── example_prototype_pollution.md  YAML frontmatter + markdown body
+```
+
+**Agents** — any subclass of `BaseAgent` in `extensions/agents/*.py` is spliced into the pipeline. Position controlled by class attribute `ENTRY_AFTER = "recon"` (or any other built-in agent NAME).
+
+**Tools** — a YAML file registers a new binary with the shell allowlist and gives the model a prompt hint on WHEN and HOW to invoke it via `run_shell`.
+
+**Techniques** — markdown files with YAML frontmatter. Loaded into an agent's system prompt ONLY when the current target context matches the frontmatter's `applies_when` rules (detected techs, endpoint globs). Same format as the bug-bounty write-ups you probably already keep in your notes — sources → sinks → payload → PoC → impact.
+
+**See [`EXTENDING.md`](EXTENDING.md) for the full guide**, including matching rules, gotchas, and how to test an extension without a full pipeline run.
+
+Extensions are pure additions: they never modify or shadow core behaviour. A malformed extension is logged and skipped, never crashes the pipeline. Toggle the entire framework with `config.yaml → extensions.enabled` (default `true`); add lookup directories with `extensions.extra_dirs: ["/opt/shared", "~/my-plugins"]`.
 
 ---
 
@@ -281,6 +333,10 @@ bughunter-harness/
 ├── scope.example.txt      Template (COPY to scope.txt and edit)
 ├── launch.example.command Sample macOS launcher
 │
+├── adversarial_reviewer.py Post-pipeline finding gate (7-question rubric)
+├── extension_loader.py    Discovery of extensions/agents,tools,techniques
+├── EXTENDING.md           Full guide to writing extensions
+│
 ├── agents/
 │   ├── base.py            BaseAgent (LLM ↔ tools loop)
 │   ├── recon.py
@@ -292,6 +348,11 @@ bughunter-harness/
 │   ├── api_fuzzer.py
 │   ├── auth.py
 │   └── report.py          Markdown consolidator (deterministic, no LLM)
+│
+├── extensions/            Drop-in add-ons (see EXTENDING.md)
+│   ├── agents/            *.py — auto-registered in the pipeline
+│   ├── tools/             *.yaml — auto-added to shell allowlist
+│   └── techniques/        *.md — knowledge base loaded by context
 │
 └── sessions/              Auto-generated per run (in .gitignore)
     └── <YYYYMMDDTHHMMSSZ>/

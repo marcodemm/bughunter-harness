@@ -45,6 +45,8 @@ from agents.wordpress import WordPressAgent
 from shared_state import SharedState
 import telegram_notifier
 import tempcleaner
+import extension_loader
+from adversarial_reviewer import AdversarialReviewer
 from ui import MultiAgentUI
 
 
@@ -64,6 +66,45 @@ AGENT_ORDER = [
     AuthAgent,
     ReportAgent,
 ]
+
+
+def _apply_extension_agents(base_order: list, cfg: dict) -> list:
+    """Discover extensions/agents/*.py and splice them into `base_order`
+    at the position declared by each agent's `ENTRY_AFTER` class attr.
+    Agents without ENTRY_AFTER go right before ReportAgent."""
+    ext_cfg = (cfg or {}).get("extensions") or {}
+    if not ext_cfg.get("enabled", True):
+        return list(base_order)
+    dirs = [Path(__file__).resolve().parent / "extensions"]
+    for extra in ext_cfg.get("extra_dirs") or []:
+        p = Path(extra).expanduser()
+        if p.is_dir():
+            dirs.append(p)
+    result = list(base_order)
+    for d in dirs:
+        for cls in extension_loader.discover_agents(d):
+            entry_after = getattr(cls, "ENTRY_AFTER", None)
+            if entry_after:
+                inserted = False
+                for i, existing in enumerate(result):
+                    if getattr(existing, "NAME", "") == entry_after:
+                        result.insert(i + 1, cls)
+                        inserted = True
+                        break
+                if not inserted:
+                    # ENTRY_AFTER points to an unknown agent — put before report
+                    _insert_before_report(result, cls)
+            else:
+                _insert_before_report(result, cls)
+            print(f"[+] extension agent loaded: {cls.NAME} "
+                  f"(from {d.name}/agents/)")
+    return result
+
+
+def _insert_before_report(order: list, cls) -> None:
+    report_idx = next((i for i, a in enumerate(order)
+                       if getattr(a, "NAME", "") == "report"), len(order))
+    order.insert(report_idx, cls)
 
 
 class Orchestrator:
@@ -88,8 +129,13 @@ class Orchestrator:
             self.tools.attach_state(self.state)
         except AttributeError:
             pass  # backwards compat with a registry that pre-dates attach_state
-        self.agent_names = [cls.NAME for cls in AGENT_ORDER]
+        # Splice in any extension agents declared under extensions/agents/
+        self.agent_order = _apply_extension_agents(AGENT_ORDER, cfg)
+        self.agent_names = [cls.NAME for cls in self.agent_order]
         self.started = 0.0
+        # Adversarial reviewer — lazy-instantiated in run() to avoid
+        # building an OpenAI client if the run aborts pre-flight.
+        self._adversarial_reviewer: AdversarialReviewer | None = None
 
     def run(self) -> SharedState:
         self.started = time.time()
@@ -116,7 +162,7 @@ class Orchestrator:
                              f"target unreachable pre-flight: {reason}")
 
         with MultiAgentUI(self.agent_names) as ui:
-            for AgentCls in AGENT_ORDER:
+            for AgentCls in self.agent_order:
                 # If pre-flight failed, skip everything except the report agent
                 if self.state.get("target_unreachable") and \
                    AgentCls is not ReportAgent:
@@ -146,6 +192,11 @@ class Orchestrator:
         elapsed = int(time.time() - self.started)
         print(f"[+] Pipeline complete in {elapsed}s. "
               f"State: {self.state.path}")
+        # Adversarial review — gate findings BEFORE regenerating the report
+        # and BEFORE notifying. Skipped when target was unreachable (nothing
+        # to review) or when the operator disabled it via config / CLI.
+        if not self.state.get("target_unreachable"):
+            self._maybe_run_adversarial_review()
         report = self.state.get("report_path")
         if report:
             print(f"[+] Report: {report}")
@@ -209,6 +260,51 @@ class Orchestrator:
             except Exception as e:
                 last_err = f"{type(e).__name__}: {str(e)[:120]}"
         return False, last_err
+
+    def _maybe_run_adversarial_review(self) -> None:
+        """Run adversarial reviewer over findings (if enabled) and
+        regenerate REPORT.md with the reviewed set.
+
+        Reviewer errors NEVER abort the pipeline — worst case is that all
+        findings pass through untouched (fail-open)."""
+        try:
+            reviewer = AdversarialReviewer(self.cfg)
+        except Exception as e:
+            print(f"[!] Adversarial reviewer init failed: "
+                  f"{type(e).__name__}: {e} — findings not gated.")
+            return
+        self._adversarial_reviewer = reviewer
+        if not reviewer.enabled:
+            return
+        print(f"[+] Adversarial review starting "
+              f"(model={reviewer.model or 'auto'}, "
+              f"min_severity={reviewer.min_severity}, "
+              f"max={reviewer.max_findings})")
+        try:
+            summary = reviewer.review(self.state)
+        except Exception as e:
+            print(f"[!] Adversarial review failed: "
+                  f"{type(e).__name__}: {e} — findings not gated.")
+            return
+        if summary.get("skipped_reason"):
+            print(f"[+] Adversarial review skipped: "
+                  f"{summary['skipped_reason']}")
+            return
+        print(f"[+] Adversarial review done: "
+              f"reviewed={summary.get('reviewed', 0)}, "
+              f"passed={summary.get('passed', 0)}, "
+              f"rejected={summary.get('rejected', 0)}")
+        # Regenerate REPORT.md so the rejected findings section reflects the review
+        try:
+            for AgentCls in self.agent_order:
+                if AgentCls is ReportAgent:
+                    ReportAgent(cfg=self.cfg, tool_registry=self.tools,
+                                 run_dir=self.run_dir,
+                                 progress_hook=None).run(self.state)
+                    break
+        except Exception as e:
+            print(f"[!] Report regeneration after review failed: "
+                  f"{type(e).__name__}: {e}")
 
     def _maybe_send_telegram(self, report_path):
         """Send REPORT.md + executive summary via Telegram if configured.
