@@ -45,6 +45,9 @@ TECH_KEYWORDS = [
     "font-awesome", "google-fonts", "google-site-kit",
     "twentytwentyone", "twentytwentytwo", "twentytwentythree",
     "twentytwentyfour",
+    # VoIP / PBX corporativo (Switchvox unauth RCE CVE-2026-9586 etc.)
+    "switchvox", "sangoma", "asterisk", "freepbx", "3cx",
+    "elastix", "grandstream",
 ]
 
 
@@ -161,6 +164,49 @@ def _recommendation_for(tech: str, version: str, url: str) -> str:
         return (
             f"1) WooCommerce vulns: https://wpscan.com/plugin/woocommerce\n"
             f"2) nuclei -u {url} -tags woocommerce -silent"
+        )
+    if tech_low in ("switchvox", "sangoma"):
+        return (
+            f"⚠️ CVE-2026-9586 (CRITICAL, CVSS 9.3): unauth SQL injection "
+            f"in POST /pa PhoneIP parameter → PostgreSQL superuser → RCE "
+            f"via COPY … FROM PROGRAM. Actively exploited since 30-Aug-2026 "
+            f"(IOC 176.65.148.184).\n"
+            f"1) Endpoint check (SAFE): curl -sI {url}pa\n"
+            f"2) Error-based SQLi probe (SAFE — triggers PostgreSQL error, "
+            f"NOT the RCE path):\n"
+            f"     curl -s -X POST {url}pa -H 'Content-Type: application/xml' "
+            f"--data '<?xml version=\"1.0\"?><request><PhoneIP>1.2.3.4\\'</PhoneIP></request>' "
+            f"| grep -iE 'postgresql|syntax error at or near|SQLSTATE'\n"
+            f"3) Version banner: curl -s {url} | grep -oiE 'Switchvox [0-9.]+'\n"
+            f"4) Fix: Sangoma Switchvox 8.4.0.2 (14-Jul-2026).\n"
+            f"5) DO NOT run COPY FROM PROGRAM (that IS the RCE) — error-based "
+            f"probe + version banner is enough evidence for bug-bounty report.\n"
+            f"6) Full playbook: refs/tecnicas/voip-pbx-patterns.md"
+        )
+    if tech_low in ("asterisk", "freepbx"):
+        return (
+            f"1) Enumerate FreePBX / Asterisk CVEs (CVE-2021-45461 unauth RCE "
+            f"in endpoint module; CVE-2023-27596 restapi auth bypass):\n"
+            f"     nuclei -u {url} -tags freepbx,asterisk -severity "
+            f"medium,high,critical -silent\n"
+            f"2) Default-cred paths (LAB / authorized only — DO NOT brute "
+            f"real targets):\n"
+            f"     FreePBX: admin/admin, maint/password\n"
+            f"     Asterisk AMI (:5038): admin/amp111\n"
+            f"3) Config leak probe: curl -sI {url}admin/config.php · "
+            f"{url}recordings/ · {url}rest/\n"
+            f"4) Full playbook: refs/tecnicas/voip-pbx-patterns.md"
+        )
+    if tech_low in ("3cx", "elastix", "grandstream"):
+        return (
+            f"1) Product-specific templates:\n"
+            f"     nuclei -u {url} -tags {tech_low} -severity "
+            f"medium,high,critical -silent\n"
+            f"2) Default admin credentials (LAB / authorized only):\n"
+            f"     Elastix: admin/palosanto  ·  Grandstream UCM: admin/admin\n"
+            f"     3CX: check welcome-email default (frequently 'admin' + "
+            f"weak password from installer)\n"
+            f"3) Full playbook: refs/tecnicas/voip-pbx-patterns.md"
         )
     if tech_low in ("wordpress-plugin", "wordpress-theme"):
         return (

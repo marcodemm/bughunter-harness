@@ -118,6 +118,13 @@ _NAME_SCORES: dict[str, int] = {
     # HIGH — asset / snipe (typical IDOR + auth-bypass surface)
     "snipe-it": 25, "snipeit": 25,
 
+    # HIGH — VoIP / PBX corporativo (unauth RCE + default creds patterns —
+    # see refs/tecnicas/voip-pbx-patterns.md · CVE-2026-9586 Switchvox etc.)
+    "switchvox": 40, "sangoma": 40, "asterisk": 30, "freepbx": 35,
+    "3cx": 30, "elastix": 25, "grandstream": 25, "ucm": 15,
+    "pbx": 30, "voip": 25, "sip": 20, "voice": 15,
+    "phones": 20, "phone": 15, "pabx": 25,
+
     # MEDIUM — auth / identity
     "auth": 25, "sso": 25, "oauth": 25, "login": 25, "signin": 25,
     "id": 20, "identity": 25, "account": 20, "accounts": 20,
