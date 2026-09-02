@@ -141,6 +141,22 @@ class ToolRegistry:
         # SharedState — attached by orchestrator after init so we can
         # auto-inject session cookies captured by login_probe agent.
         self.state = None
+        # Custom headers auto-injected on every http_get / http_post.
+        # Normalized to dict[str,str], skipping empty values.
+        raw = cfg.get("custom_headers") or {}
+        self.custom_headers: dict[str, str] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if k and v is not None:
+                    self.custom_headers[str(k)] = str(v)
+        elif isinstance(raw, list):
+            # Accept ["Name: value", ...] form too
+            for item in raw:
+                if ":" in str(item):
+                    n, v = str(item).split(":", 1)
+                    n, v = n.strip(), v.strip()
+                    if n and v:
+                        self.custom_headers[n] = v
         # Extension tools — discovered by extension_loader.discover_tools()
         # at ToolRegistry construction. Adds binaries to SHELL_ALLOWLIST and
         # exposes prompt hints to agents via extension_tools_prompt_hint().
@@ -172,22 +188,6 @@ class ToolRegistry:
                 self.extension_tools)
         except Exception:
             return ""
-        # Custom headers auto-injected on every http_get / http_post.
-        # Normalized to dict[str,str], skipping empty values.
-        raw = cfg.get("custom_headers") or {}
-        self.custom_headers: dict[str, str] = {}
-        if isinstance(raw, dict):
-            for k, v in raw.items():
-                if k and v is not None:
-                    self.custom_headers[str(k)] = str(v)
-        elif isinstance(raw, list):
-            # Accept ["Name: value", ...] form too
-            for item in raw:
-                if ":" in str(item):
-                    n, v = str(item).split(":", 1)
-                    n, v = n.strip(), v.strip()
-                    if n and v:
-                        self.custom_headers[n] = v
 
     def attach_state(self, state) -> None:
         """Attach the SharedState so http_get/http_post can auto-inject
