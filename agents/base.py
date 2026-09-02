@@ -147,6 +147,14 @@ class BaseAgent:
     MAX_ITERATIONS: int = 20
     TOOL_NAMES: list[str] = ["http_get", "http_post", "run_shell",
                              "oob_generate_token", "finish"]
+    # When True, the strings the model passes in finish(findings=[...])
+    # are NOT auto-converted into state.findings entries. Set True in
+    # agents whose after_run() generates ITS OWN structured findings with
+    # full evidence + recommendation (e.g. fingerprint) — otherwise both
+    # a stub finding (from finish) AND a rich one (from after_run) end
+    # up in the report as visible duplicates.
+    # The narrative summary is still saved either way.
+    SKIP_AUTO_FINDINGS_FROM_FINISH: bool = False
 
     def __init__(self, cfg: dict, tool_registry, run_dir: Path,
                  progress_hook=None):
@@ -437,6 +445,12 @@ class BaseAgent:
                 "summary": clean_summary[:2000],
                 "ts": _now_iso(),
             })
+
+        # If the concrete agent's after_run generates its own rich findings
+        # (evidence + recommendation), skip the stub-from-finish path to
+        # avoid duplicate visible entries in the report.
+        if self.SKIP_AUTO_FINDINGS_FROM_FINISH:
+            return
 
         for f in collected:
             # Extract severity from prefix "critical — ...", "[HIGH] ...",
