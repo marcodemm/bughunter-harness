@@ -186,7 +186,11 @@ Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH
 > http://localhost:3000/
 ```
 
-![Bughunter Harness command-line interface](images/application-command-line-interface.png)
+![Bughunter Harness command-line interface — pipeline starting](images/application-command-line-interface.png)
+*Pipeline start — target and agent queue announced, first agents entering `RUNNING`.*
+
+![Bughunter Harness command-line interface — pipeline complete](images/application-command-line-interface-end.png)
+*Pipeline complete — every agent's final status, elapsed time and note.*
 
 The orchestrator will run the 9 agents in sequence and produce a `sessions/<run-id>/REPORT.md` at the end.
 
