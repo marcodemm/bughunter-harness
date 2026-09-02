@@ -61,8 +61,8 @@ _NAME_SCORES: dict[str, int] = {
     "websocket": 25, "mobile": 25, "mapi": 30, "gapi": 30, "apis": 25,
 
     # HIGH — well-known infrastructure products (usually admin panels)
-    "jenkins": 40, "gitlab": 40, "gitea": 30, "gogs": 30,
-    "jira": 35, "confluence": 35, "wiki": 20,
+    "jenkins": 40, "gitlab": 40, "gitea": 30, "gogs": 30, "forgejo": 25,
+    "jira": 35, "confluence": 35, "wiki": 20, "wiki-js": 20, "wikijs": 20,
     "grafana": 40, "kibana": 40, "prometheus": 35, "nagios": 35,
     "zabbix": 35, "cacti": 30, "opsview": 30,
     "kubernetes": 40, "k8s": 40, "rancher": 40, "portainer": 40,
@@ -72,6 +72,51 @@ _NAME_SCORES: dict[str, int] = {
     "minio": 35, "elasticsearch": 40, "kbn": 30,
     "sonarqube": 30, "sonar": 30, "artifactory": 30, "nexus": 30,
     "harbor": 30, "quay": 30, "registry": 30,
+
+    # HIGH — self-hosted internal tools with strong CVE history
+    # (workflow automation / low-code / dev-tools — heavy RCE-hunt targets)
+    "n8n": 40, "hasura": 35, "superset": 35, "guacamole": 35,
+    "rundeck": 35, "awx": 35, "argocd": 35, "argo": 25,
+    "code-server": 35, "coder": 30, "gitpod": 30, "theia": 25,
+    "appsmith": 30, "retool": 25, "budibase": 25, "tooljet": 25,
+    "openldap": 30, "phpldapadmin": 40, "ldapadmin": 30,
+    "jupyterhub": 30, "jupyter": 25,
+    "cloudpanel": 35, "caprover": 30, "hestiacp": 30, "vestacp": 30,
+    "webmin": 40, "ispmanager": 30, "virtualmin": 35,
+
+    # MEDIUM-HIGH — headless CMS / ERP / project mgmt
+    "strapi": 30, "directus": 30, "payload": 25,
+    "odoo": 30, "erpnext": 25, "frappe": 25,
+    "redmine": 25, "openproject": 20, "taiga": 20,
+    "kanboard": 20, "wekan": 15, "focalboard": 15, "plane": 20,
+    "mautic": 25, "sendportal": 20, "listmonk": 20,
+
+    # MEDIUM-HIGH — chat / community (XSS/IDOR historical)
+    "chat": 15, "chattickets": 15, "chatai": 15,
+    "chatwoot": 30, "rocketchat": 30, "mattermost": 30,
+    "discourse": 25, "zulip": 20, "element": 15, "synapse": 20,
+
+    # MEDIUM — self-hosted file / photo / media
+    "nextcloud": 25, "owncloud": 25, "seafile": 25,
+    "immich": 25, "paperless": 20, "paperless-ngx": 20,
+    "outline": 20, "bookstack": 20,
+    "filebrowser": 25, "filerun": 25, "filecloud": 20,
+    "jellyfin": 20, "plex": 20, "emby": 20,
+
+    # MEDIUM — analytics / observability / BI (SSRF/leak historical)
+    "umami": 25, "plausible": 20, "matomo": 25, "piwik": 25,
+    "posthog": 25, "sentry": 20, "glitchtip": 15,
+    "redash": 25, "prefect": 25, "temporal": 25,
+
+    # MEDIUM — status pages / uptime monitoring
+    "uptime-kuma": 15, "uptimekuma": 15, "healthchecks": 15,
+    "cachet": 15, "statping": 15, "gatus": 15,
+
+    # LOW-MEDIUM — dev tools / stats
+    "wakapi": 15, "changedetection": 15, "grimoirelab": 20,
+
+    # HIGH — asset / snipe (typical IDOR + auth-bypass surface)
+    "snipe-it": 25, "snipeit": 25,
 
     # MEDIUM — auth / identity
     "auth": 25, "sso": 25, "oauth": 25, "login": 25, "signin": 25,
@@ -130,6 +175,19 @@ _NAME_SCORES: dict[str, int] = {
     # LOW — plain web
     "www": 5, "web": 5, "site": 5, "home": 5,
     "blog": 8, "news": 5, "press": 5, "tv": 5, "video": 5,
+
+    # NEGATIVE — third-party managed services that almost never yield bounty
+    # (they're operated by the vendor, not the target org — mostly out of scope)
+    "clerk": -10,          # clerk.dev (auth-as-a-service) frontend-api
+    "auth0-app": -5,       # auth0 hosted login (also out-of-scope typically)
+    "cognito": -5,         # AWS Cognito hosted UI
+    "supertokens": -5,     # supertokens managed
+    "firebaseapp": -10,    # firebase-hosted
+    "netlify": -5,         # netlify-hosted static
+    "vercel": -5,          # vercel-hosted static/edge
+    "herokuapp": -5,       # heroku-hosted
+    "onrender": -5,        # render.com-hosted
+    "githubusercontent": -10,  # github pages / raw
 }
 
 # ── Signal 2: HTTP status ───────────────────────────────────────────
@@ -336,6 +394,44 @@ def _title_kills_score(title: str) -> bool:
     return any(k in low for k in _TITLE_HARD_KILLERS)
 
 
+# Cloudflare (or similar) anti-bot challenge markers. When we hit one of
+# these, the HTTP response is the CHALLENGE PAGE, not the real app — no
+# non-browser tool (curl / nuclei / ffuf) can pass without a JA3-impersonating
+# client (curl-impersonate, headless Chrome). Penalize hard so multi-host
+# doesn't burn 30-60 min per sub scanning challenge pages.
+_CF_CHALLENGE_TITLES = [
+    "just a moment",                       # Cloudflare classic challenge
+    "attention required",                  # Cloudflare block page
+    "one moment please",                   # Cloudflare variant
+    "checking your browser",               # Cloudflare / DataDome
+    "please wait...",                      # Sucuri / generic anti-bot
+    "please wait while we check",          # Cloudflare
+    "verify you are human",                # Turnstile / Cloudflare
+    "sorry, you have been blocked",        # Cloudflare block
+    "access denied",                       # Akamai / generic
+    "pardon our interruption",             # PerimeterX
+]
+
+
+def _is_bot_challenge_page(host_record: dict) -> bool:
+    """True if the recorded HTTP response looks like an anti-bot challenge
+    page (Cloudflare Bot Management, DataDome, PerimeterX, Sucuri, …) —
+    i.e. the tools can't reach the real app without a browser-fingerprint
+    bypass. Signals: status 403 or 503 + telltale title + WAF tech marker."""
+    status = host_record.get("status")
+    title_low = str(host_record.get("title") or "").lower()
+    techs_low = [str(t).lower() for t in (host_record.get("tech") or [])]
+    title_hit = any(m in title_low for m in _CF_CHALLENGE_TITLES)
+    tech_hit = any(("cloudflare" in t and ("bot" in t or "challenge" in t))
+                    or "turnstile" in t or "datadome" in t
+                    or "perimeterx" in t or "sucuri" in t
+                    for t in techs_low)
+    denied_status = status in (403, 503)
+    # Any TWO of the three signals is enough (title alone can false-positive
+    # on legit pages named "please wait"; status alone false-positives too).
+    return sum([title_hit, tech_hit, denied_status]) >= 2
+
+
 # ── Combine ─────────────────────────────────────────────────────────
 def score_host(host_record: dict) -> dict:
     hostname = str(host_record.get("host", ""))
@@ -365,6 +461,20 @@ def score_host(host_record: dict) -> dict:
                         f"expired → capped from {total} to {capped}")
         total = capped
 
+    # Anti-bot challenge page penalty. Even if the sub name is juicy
+    # (`accounts.foo.com`), if the HTTP response is a CF/DataDome/etc.
+    # challenge, no non-browser tool can scan it. Push it to LOW tier so
+    # multi-host burns time on subs it can actually attack.
+    cf_challenge = _is_bot_challenge_page(host_record)
+    if cf_challenge:
+        penalty = 30
+        total -= penalty
+        reasons.append(
+            f"⚠️ ANTI-BOT CHALLENGE detected (status={host_record.get('status')} "
+            f"title={host_record.get('title','')!r:.60}) — non-browser tools "
+            f"cannot pass; penalty -{penalty}. Bypass with curl-impersonate "
+            f"or headless Chrome to scan for real.")
+
     return {
         "host": hostname,
         "score": total,
@@ -372,8 +482,10 @@ def score_host(host_record: dict) -> dict:
         "components": {
             "name": n_s, "status": st_s, "tech": te_s,
             "title": ti_s, "ports": po_s, "penalty": pen_s,
+            "cf_challenge": -30 if cf_challenge else 0,
         },
         "reasons": reasons,
+        "bot_challenge": cf_challenge,
     }
 
 

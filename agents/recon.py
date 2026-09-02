@@ -27,7 +27,13 @@ DO NOT test vulnerabilities. That is another agent's job.
 Workflow (execute these tool_calls in order, then finish):
   1. subfinder -d <apex-domain> -silent
   2. dnsx -l <subs-file> -a -aaaa -silent            (if dnsx available)
-  3. httpx -l <subs-file> -silent -status -title -tech-detect -json
+  3. httpx -l <subs-file> -silent -status-code -title -tech-detect -json
+     ↑ IMPORTANT: run WITHOUT -o <file>. The harness parses httpx's stdout
+       — using -o silences stdout and the harness sees nothing.
+     ↑ IMPORTANT: DO NOT filter the output by status_code (no `jq
+       'select(.status_code >= 200 and .status_code < 400)'`). Hosts that
+       answer 401 or 403 are AUTH-PROTECTED — MORE interesting than a
+       plain 200 (they hide something). Keep them all.
   4. naabu -host <apex> -top-ports 100 -silent       (if naabu available)
   5. finish() with a short summary listing subs/live hosts count
 
@@ -72,6 +78,12 @@ Rules:
     def after_run(self, state, transcript):
         subs: set[str] = set()
         live: list[dict] = []
+        # Track file paths the model may have redirected httpx output to
+        # with `-o /tmp/…json`. If we see one, we'll read it after the loop
+        # to recover records the model may have filtered out with jq.
+        httpx_out_files: set[str] = set()
+        import json as _j
+
         for entry in transcript:
             if entry.get("tool") != "run_shell":
                 continue
@@ -82,9 +94,12 @@ Rules:
                 for m in re.finditer(r"^([a-z0-9._-]+\.[a-z]{2,})\s*$",
                                      result, re.MULTILINE | re.IGNORECASE):
                     subs.add(m.group(1).lower())
-            # httpx json output
+            # httpx json output — parse EVERY JSON line in the raw result,
+            # regardless of status_code. 401/403 are auth-protected =
+            # interesting; 200 is public; keep both.
             if "httpx" in cmd and "-json" in cmd:
-                import json as _j
+                for m in re.finditer(r"-o\s+(\S+)", cmd):
+                    httpx_out_files.add(m.group(1))
                 for line in result.splitlines():
                     line = line.strip()
                     if not line.startswith("{"):
@@ -93,16 +108,7 @@ Rules:
                         rec = _j.loads(line)
                     except Exception:
                         continue
-                    host = rec.get("host") or rec.get("input") or ""
-                    live.append({
-                        "host": host,
-                        "scheme": rec.get("scheme", "https"),
-                        "status": rec.get("status_code")
-                                    or rec.get("status-code"),
-                        "title": rec.get("title", ""),
-                        "tech": rec.get("tech")
-                                or rec.get("technologies") or [],
-                    })
+                    _append_httpx_record(live, rec)
             # naabu → host:port
             if "naabu" in cmd:
                 for m in re.finditer(r"^([a-z0-9._-]+):(\d+)\s*$",
@@ -112,6 +118,42 @@ Rules:
                         "port": int(m.group(2)),
                         "scheme": "tcp",
                     })
+
+        # Fallback: recover records from httpx `-o <file>` when the model
+        # silenced stdout. Also protects against `jq 'select(.status < 400)'`
+        # filtering — reading the raw file gets us EVERY record httpx wrote.
+        for path in httpx_out_files:
+            try:
+                from pathlib import Path as _P
+                p = _P(path)
+                if not p.is_file() or p.stat().st_size > 20 * 1024 * 1024:
+                    continue  # 20 MB safety cap
+                for line in p.read_text(encoding="utf-8",
+                                          errors="ignore").splitlines():
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        rec = _j.loads(line)
+                    except Exception:
+                        continue
+                    _append_httpx_record(live, rec)
+            except Exception:
+                pass  # never let a file read break the pipeline
+
+        # Deduplicate live hosts by (host, port|scheme) — the fallback file
+        # read may re-add records the stdout parser already saw.
+        seen: set[tuple] = set()
+        deduped: list[dict] = []
+        for h in live:
+            key = (str(h.get("host", "")).lower(),
+                   h.get("port"), h.get("scheme"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(h)
+        live = deduped
+
         if subs:
             state.extend("subdomains", sorted(subs))
         if live:
@@ -123,6 +165,23 @@ Rules:
                     techs.add(str(t).lower())
             if techs:
                 state.extend("detected_techs", sorted(techs))
+
+
+def _append_httpx_record(live: list, rec: dict) -> None:
+    """Extract a single httpx JSON record into a live_hosts dict entry.
+    Does NOT filter by status_code — 401/403 auth-protected hosts are
+    kept because they are MORE interesting than a public 200 (they hide
+    something)."""
+    host = rec.get("host") or rec.get("input") or ""
+    if not host:
+        return
+    live.append({
+        "host": host,
+        "scheme": rec.get("scheme", "https"),
+        "status": rec.get("status_code") or rec.get("status-code"),
+        "title": rec.get("title", ""),
+        "tech": rec.get("tech") or rec.get("technologies") or [],
+    })
 
 
 def _extract_apex(target: str) -> str:
