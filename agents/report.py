@@ -58,6 +58,19 @@ class ReportAgent(BaseAgent):
                          "authentication headers / VPN / IP allowlisting if the "
                          "target requires them.")
             lines.append("")
+        elif s.get("preflight_warning"):
+            reason = s.get("preflight_warning_reason", "(no reason recorded)")
+            lines.append("> ⚠️ **Pre-flight WARNING — python-requests probe failed, "
+                         "pipeline continued anyway.**")
+            lines.append(f"> Reason: `{reason}`")
+            lines.append(">")
+            lines.append("> The agents' Go/curl-based tools may have reached the "
+                         "target where the probe couldn't. If findings below look "
+                         "empty and every agent's tool_activity shows exit≠0, the "
+                         "target is likely truly down or IP-blocking you — retry "
+                         "from a different exit node, or pass `--strict-preflight` "
+                         "next time to abort early on this class of failure.")
+            lines.append("")
 
         lines.append(f"- **Target:** `{s.get('target')}`")
         lines.append(f"- **In-scope hosts:** `{s.get('in_scope_hosts')}`")

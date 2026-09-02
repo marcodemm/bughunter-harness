@@ -127,12 +127,18 @@ class Orchestrator:
                  target: str, in_scope: list[str] | None,
                  sessions_root: Path,
                  telegram_chat_id: str | None = None,
-                 skip_preflight: bool = False):
+                 skip_preflight: bool = False,
+                 strict_preflight: bool = False):
         self.cfg = cfg
         self.tools = tool_registry
         self.target = target
         self.telegram_chat_id = telegram_chat_id
         self.skip_preflight = skip_preflight
+        # When True, a pre-flight failure ABORTS the pipeline (previous
+        # behavior). When False (default), it's a WARN + continue — the
+        # LLM agents may reach the target with tools that use different
+        # TLS/HTTP stacks than python-requests.
+        self.strict_preflight = strict_preflight
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.run_dir = sessions_root / run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -158,9 +164,23 @@ class Orchestrator:
         print(f"[+] Target: {self.target}")
         print(f"[+] Agents queued: {', '.join(self.agent_names)}")
 
-        # Pre-flight: bail out if the target is not reachable (unless
-        # explicitly disabled with --skip-preflight, e.g. target needs VPN).
-        # Prevents wasting 20-30 minutes of agent turns on a dead host.
+        # Pre-flight — three modes:
+        #   1) --skip-preflight   → do not probe (VPN/allowlist targets)
+        #   2) default (soft)     → probe; if unreachable, WARN + continue
+        #                            (agent tools may use different TLS
+        #                            libraries — curl-LibreSSL, Go stdlib,
+        #                            openssl — and get further than the
+        #                            python-requests probe used here).
+        #   3) preflight.strict   → probe; if unreachable, ABORT pipeline
+        #                            (previous behavior; useful when you
+        #                            want to save LLM turns on truly dead
+        #                            targets).
+        # Strict mode is picked from cfg.preflight.strict OR the
+        # `strict_preflight` attribute set by harness.py from
+        # --strict-preflight.
+        pf_cfg = self.cfg.get("preflight") or {}
+        pf_strict = bool(getattr(self, "strict_preflight", False)
+                          or pf_cfg.get("strict", False))
         if self.skip_preflight:
             print("[+] Pre-flight skipped (--skip-preflight)")
             alive, reason = True, "pre-flight skipped by --skip-preflight"
@@ -168,13 +188,27 @@ class Orchestrator:
             alive, reason = self._target_reachable(self.target)
             print(f"[+] Pre-flight: {'ALIVE' if alive else 'UNREACHABLE'} · {reason}")
         if not alive:
-            print(f"\n[!] TARGET UNREACHABLE — aborting pipeline.")
-            print(f"    Reason: {reason}")
-            print(f"    Only the report agent will run to document the failure.")
-            self.state.set("target_unreachable", True)
-            self.state.set("target_unreachable_reason", reason)
-            self.state.error("orchestrator",
-                             f"target unreachable pre-flight: {reason}")
+            if pf_strict:
+                print(f"\n[!] TARGET UNREACHABLE — aborting pipeline "
+                      f"(preflight.strict / --strict-preflight).")
+                print(f"    Reason: {reason}")
+                print(f"    Only the report agent will run to document the failure.")
+                self.state.set("target_unreachable", True)
+                self.state.set("target_unreachable_reason", reason)
+                self.state.error("orchestrator",
+                                  f"target unreachable pre-flight: {reason}")
+            else:
+                print(f"\n[!] Pre-flight WARNING — target didn't answer the "
+                      f"HTTP probe, but continuing anyway (agents may use "
+                      f"different TLS/HTTP tools that pass through).")
+                print(f"    Reason: {reason}")
+                print(f"    Pass --strict-preflight to abort instead.")
+                # Non-abort path: expose the warning so REPORT.md can show it,
+                # but DO NOT set target_unreachable → agents run normally.
+                self.state.set("preflight_warning", True)
+                self.state.set("preflight_warning_reason", reason)
+                self.state.error("orchestrator",
+                                  f"preflight warning (soft): {reason}")
 
         mh_cfg = self.cfg.get("multi_host") or {}
         multi_host_enabled = bool(mh_cfg.get("enabled", False))

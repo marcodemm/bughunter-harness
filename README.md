@@ -367,7 +367,7 @@ Extensions are pure additions: they never modify or shadow core behaviour. A mal
 - **Scope allowlist** cotejado antes de cada request (host/wildcard/CIDR/IP). Off-scope → error (strict mode) or warning (warn mode).
 - **Shell allowlist** — only pre-approved binaries (`nmap nuclei ffuf curl dig …`) can run. Destructive commands (`rm`, `sudo`, `mv`, `chmod`, backticks, `$(…)`) are hard-denied.
 - **Output redaction** — `redact.py` scrubs JWT / AWS keys / GitHub tokens / cookies / emails from every tool output before it reaches the model or the report.
-- **Pre-flight reachability check** — the orchestrator sends a single HTTP GET to the target before spawning any agent; if the target is unreachable, the pipeline is aborted and REPORT.md carries a `🚨 TARGET UNREACHABLE` banner.
+- **Pre-flight reachability check** — the orchestrator sends a single HTTP GET to the target before spawning any agent. By default (soft-warn) a failure is a `⚠️ Pre-flight warning` banner and the pipeline continues — the agents' Go/curl-based tools use different TLS/HTTP stacks than python-requests and often pass where the probe hits JA3/JA4 blocking or a fussy handshake. Pass `--strict-preflight` (or `preflight.strict: true` in config) to abort instead — REPORT.md then carries a `🚨 TARGET UNREACHABLE` banner and no LLM turns burn against a dead host. Pass `--skip-preflight` to not probe at all.
 - **Cleanup** — temp files created by the agents (`/tmp/harness-*`, `/tmp/gau_*`, `/tmp/nuclei_*`, …) are wiped after each run.
 
 ---

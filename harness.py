@@ -443,6 +443,7 @@ USAGE
   python harness.py --multi-host             → loop scan over top-N ranked subs
   python harness.py --single-host            → force single-host (opposite)
   python harness.py --top-hosts 5            → override top_n for multi-host
+  python harness.py --strict-preflight       → abort pipeline on preflight fail
   python harness.py --legacy                 → single-agent classic loop
   python harness.py --skip-preflight         → do not check target liveness first
   python harness.py --one-shot               → single run then exit
@@ -476,6 +477,7 @@ REPL COMMANDS
     --multi-host / --single-host     force multi-host loop over ranked subs /
                                      force single-host (opposite)
     --top-hosts N                    top-N subs to scan in multi-host mode
+    --strict-preflight               abort on preflight failure (opt-in)
     -o PATH                          session log destination
   Pass an empty value to clear a sticky:  --header ""    --scope ""    --email ""
 
@@ -675,16 +677,23 @@ PRE-FLIGHT REACHABILITY CHECK
   target (10 s timeout, honours --header attribution). Any HTTP response
   (200, 301, 401, 403, 500 …) counts as ALIVE — the server is up, endpoints
   may just be protected. Only network-level failures (DNS fail, connect
-  timeout, connection refused) count as UNREACHABLE.
+  timeout, connection refused, TLS RST) count as UNREACHABLE.
 
-  On UNREACHABLE:
-    * The pipeline is ABORTED — recon / fingerprint / vuln agents skipped.
-    * The report agent still runs and produces a REPORT.md whose first line
-      is a 🚨 TARGET UNREACHABLE alert with the exact network error.
-    * No wasted LLM turns against a dead host.
-
-  Skip the pre-flight with --skip-preflight if the target requires VPN,
-  IP allowlisting or attribution headers before it will answer.
+  Three modes:
+    * DEFAULT (soft-warn):  On UNREACHABLE, WARN + continue. The agents
+                             still run — their Go stdlib TLS (nuclei /
+                             httpx / subfinder / dnsx) or curl LibreSSL
+                             may reach the target where python-requests
+                             couldn't. REPORT.md carries a ⚠️ Pre-flight
+                             warning banner with the network error.
+    * --strict-preflight:   Abort the pipeline on UNREACHABLE. Only the
+                             report agent runs, and REPORT.md shows a
+                             🚨 TARGET UNREACHABLE banner. Use when you
+                             want to save LLM turns on truly dead hosts.
+                             Same as `preflight.strict: true` in config.
+    * --skip-preflight:     Do not probe at all. Use when the target
+                             requires VPN / IP allowlisting / attribution
+                             headers before it will answer.
 
 LLM BACKEND  (7 backends: 3 local + 4 cloud)
   All backends speak the OpenAI-compatible chat.completions protocol.
@@ -1007,6 +1016,10 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
             except ValueError:
                 pass
             i += 1; continue
+        # --strict-preflight : abort pipeline on unreachable target
+        if t == "--strict-preflight":
+            overrides["strict_preflight"] = True
+            i += 1; continue
         remaining.append(t)
         i += 1
     return " ".join(remaining), overrides
@@ -1054,7 +1067,8 @@ def _should_notify(cfg: dict, state) -> bool:
 def _run_orchestrated(cfg: dict, objective: str,
                       scope_override, output_override, email_to,
                       telegram_chat_id: str | None = None,
-                      skip_preflight: bool = False):
+                      skip_preflight: bool = False,
+                      strict_preflight: bool = False):
     """Run the multi-agent Orchestrator for one objective."""
     # Scope: same precedence as single-agent
     if scope_override:
@@ -1082,7 +1096,8 @@ def _run_orchestrated(cfg: dict, objective: str,
                         in_scope=scope_override or None,
                         sessions_root=sessions_root,
                         telegram_chat_id=telegram_chat_id,
-                        skip_preflight=skip_preflight)
+                        skip_preflight=skip_preflight,
+                        strict_preflight=strict_preflight)
     state = orch.run()
 
     # Resolve final email destination:
@@ -1216,10 +1231,17 @@ def main():
                          "multi-agent orchestrator. Useful for debugging.")
     ap.add_argument("--skip-preflight", action="store_true",
                     help="Skip the pre-flight reachability check on the "
-                         "target. Use when the target requires VPN / custom "
-                         "headers / IP allowlisting that only the agents "
-                         "would satisfy. Without this flag the orchestrator "
-                         "aborts if the target does not respond within 10s.")
+                         "target entirely. Use when the target requires VPN / "
+                         "custom headers / IP allowlisting that only the "
+                         "agents would satisfy.")
+    ap.add_argument("--strict-preflight", action="store_true",
+                    help="ABORT the pipeline when the pre-flight probe "
+                         "fails (previous default behavior). Without this "
+                         "flag, a pre-flight failure is a WARN + continue: "
+                         "the agents still run because their Go/curl-based "
+                         "tools may use a different TLS/HTTP stack than the "
+                         "python-requests probe and get further. Equivalent "
+                         "to setting preflight.strict: true in config.yaml.")
     ap.add_argument("--no-adversarial", action="store_true",
                     help="Disable the post-pipeline adversarial reviewer for "
                          "this run. Findings are NOT gated — every finding "
@@ -1296,6 +1318,8 @@ def main():
     else:
         session_multi_host = None
     session_top_hosts: int | None = args.top_hosts
+    # Strict preflight sticky override (CLI wins over config.preflight.strict)
+    session_strict_preflight: bool = bool(args.strict_preflight)
     pending_objective = args.objective  # first-turn seed from CLI, if any
     is_first = True
 
@@ -1393,6 +1417,10 @@ def main():
         if "top_hosts" in overrides:
             session_top_hosts = int(overrides["top_hosts"])
             print(f"[+] top_hosts set (sticky): {session_top_hosts}")
+        if "strict_preflight" in overrides:
+            session_strict_preflight = bool(overrides["strict_preflight"])
+            print(f"[+] Strict pre-flight ENABLED (sticky): a probe fail "
+                  "will abort the pipeline.")
 
         # 3. If line was just flags (no objective text), re-prompt without exiting
         if not objective:
@@ -1463,7 +1491,8 @@ def main():
                 _run_orchestrated(cfg_run, objective, session_scope,
                                   session_output, session_email,
                                   telegram_chat_id=session_telegram,
-                                  skip_preflight=args.skip_preflight)
+                                  skip_preflight=args.skip_preflight,
+                                  strict_preflight=session_strict_preflight)
         except Exception as e:
             print(f"[!] Session error: {e}")
 

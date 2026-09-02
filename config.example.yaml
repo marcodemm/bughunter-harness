@@ -67,6 +67,29 @@ cleanup_tempfiles: true
 # Set to false to always notify (useful for debugging the pipeline).
 notify_only_if_findings: true
 
+# ─────────── Pre-flight reachability check ─────────────────────────
+# Before spawning any agent, the orchestrator sends a single HTTP GET
+# via python-requests to the target (10s timeout). Behavior on failure
+# depends on `strict`:
+#
+#   strict: false (DEFAULT — soft-warn)
+#     A probe fail is a WARN + continue. Agents still run — their
+#     Go-stdlib TLS (nuclei / httpx / subfinder / dnsx) or curl-LibreSSL
+#     often reach targets where python-requests hits JA3/JA4 blocking
+#     or a fussy handshake. REPORT.md gets a ⚠️ Pre-flight warning banner.
+#
+#   strict: true
+#     A probe fail ABORTS the pipeline (previous behavior). Only the
+#     report agent runs; REPORT.md carries a 🚨 TARGET UNREACHABLE
+#     banner. Use when you want to save LLM turns on truly dead hosts.
+#
+# CLI flags override this section:
+#   --strict-preflight   → strict: true for this run
+#   --skip-preflight     → do not probe at all (for VPN/allowlist targets)
+preflight:
+  strict: false                # true = ABORT on probe fail, false = WARN
+  timeout_sec: 10              # HTTP GET timeout for the probe
+
 # ─────────── Adversarial review (post-pipeline gate) ───────────────
 # After the report agent finishes, each finding whose severity is >=
 # min_severity is sent to an LLM for adversarial verification. Findings
