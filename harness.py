@@ -440,6 +440,9 @@ USAGE
   python harness.py --base-url URL           → custom OpenAI-compatible URL
   python harness.py --no-adversarial         → skip post-pipeline finding review
   python harness.py --adversarial-model M    → different model for the reviewer
+  python harness.py --multi-host             → loop scan over top-N ranked subs
+  python harness.py --single-host            → force single-host (opposite)
+  python harness.py --top-hosts 5            → override top_n for multi-host
   python harness.py --legacy                 → single-agent classic loop
   python harness.py --skip-preflight         → do not check target liveness first
   python harness.py --one-shot               → single run then exit
@@ -470,6 +473,9 @@ REPL COMMANDS
     --no-adversarial                 disable post-pipeline finding reviewer
     --adversarial-model MODEL_ID     override reviewer model (default: same
                                      as --model)
+    --multi-host / --single-host     force multi-host loop over ranked subs /
+                                     force single-host (opposite)
+    --top-hosts N                    top-N subs to scan in multi-host mode
     -o PATH                          session log destination
   Pass an empty value to clear a sticky:  --header ""    --scope ""    --email ""
 
@@ -573,6 +579,38 @@ CUSTOM HTTP HEADERS  (researcher attribution)
   nikto / wpscan / feroxbuster shell commands.
 
   Clear all with an empty value:  --header ""
+
+MULTI-HOST MODE  (loop scan over ranked subdomains)
+  Default is single-host: the pipeline scans state.live_hosts[0] only. That
+  works when your target is one URL, but on wildcard targets like
+  --scope "*.example.com" you'd miss admin.example.com / dev.example.com /
+  api.example.com etc.
+
+  Enable multi-host with --multi-host (per run) or multi_host.enabled=true
+  in config.yaml. In multi-host mode the pipeline is split into 3 phases:
+
+    PHASE 1 (once):        recon → sub_prioritizer → (any non-repeated agent)
+    PHASE 2 (once/sub):    fingerprint → content_discovery → login_probe →
+                            web_vuln → wordpress → api_fuzzer → auth
+                            (repeated for each top-N prioritized sub)
+    PHASE 3 (once):        report
+
+  sub_prioritizer ranks state.live_hosts by 5 signals — name (admin/dev/
+  api/jenkins/gitlab/grafana → high · www/blog/cdn → low), HTTP status
+  (401/403 = protected/juicy · 500 = broken/exploitable), detected tech
+  (CRITICAL products list: adminer, phpmyadmin, jenkins, grafana, portainer
+  etc.), title sniffing (index of / login / admin panel → +, for sale /
+  parked / expired → hard-cap to LOW), and open-port anomalies (2375 docker
+  daemon = +20, DBs on default ports = +15, web on 8080/8443 = +8).
+
+  Selection: top_n subs by score (default 3), filtered by min_score
+  (default 30). If nothing meets min_score the top_n subs still get scanned.
+
+  Cost is LINEAR in top_n — with LM Studio + Qwen v8 count on ~25-40 min
+  per sub. Use --skip-preflight and --no-adversarial for speed.
+
+  Findings from each per-sub pass are tagged sub_scanned=<host> so the
+  REPORT.md groups them per subdomain.
 
 ADVERSARIAL REVIEW  (post-pipeline finding gate)
   After the report agent runs, an adversarial reviewer sends each finding
@@ -943,6 +981,26 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
         if t.startswith("--adversarial-model="):
             overrides["adversarial_model"] = t.split("=", 1)[1]
             i += 1; continue
+        # --multi-host / --single-host : force multi-host toggle for this run
+        if t == "--multi-host":
+            overrides["multi_host"] = True
+            i += 1; continue
+        if t == "--single-host":
+            overrides["multi_host"] = False
+            i += 1; continue
+        # --top-hosts N : override top_n for multi-host mode
+        if t == "--top-hosts" and i + 1 < len(tokens):
+            try:
+                overrides["top_hosts"] = int(tokens[i + 1])
+            except ValueError:
+                pass
+            i += 2; continue
+        if t.startswith("--top-hosts="):
+            try:
+                overrides["top_hosts"] = int(t.split("=", 1)[1])
+            except ValueError:
+                pass
+            i += 1; continue
         remaining.append(t)
         i += 1
     return " ".join(remaining), overrides
@@ -1172,6 +1230,25 @@ def main():
                          "you want e.g. local Qwen for agents + cloud "
                          "Sonnet for the review. Overrides "
                          "config.yaml → adversarial_review.model.")
+    # Multi-host mode — two mutually exclusive toggles + top-N override.
+    mh_group = ap.add_mutually_exclusive_group()
+    mh_group.add_argument("--multi-host", dest="multi_host",
+                          action="store_true", default=None,
+                          help="Force multi-host mode for this run: after "
+                               "sub_prioritizer ranks live_hosts, the pipeline "
+                               "runs fingerprint→content_discovery→…→auth "
+                               "once per top-N sub. Great for --scope "
+                               "'*.example.com' targets. Overrides "
+                               "config.yaml → multi_host.enabled.")
+    mh_group.add_argument("--single-host", dest="single_host",
+                          action="store_true", default=None,
+                          help="Force single-host mode for this run (opposite "
+                               "of --multi-host). Overrides "
+                               "config.yaml → multi_host.enabled.")
+    ap.add_argument("--top-hosts", dest="top_hosts", type=int, metavar="N",
+                    help="In multi-host mode, override top_n: scan the top-N "
+                         "prioritized subs (default: 3 per config.yaml). "
+                         "Overrides config.yaml → multi_host.top_n.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -1202,6 +1279,17 @@ def main():
     # Adversarial reviewer sticky overrides
     session_no_adversarial: bool = bool(args.no_adversarial)
     session_adversarial_model: str | None = args.adversarial_model
+    # Multi-host sticky overrides — 3-state:
+    #   True  = force multi-host
+    #   False = force single-host
+    #   None  = use config.yaml value
+    if args.multi_host:
+        session_multi_host: bool | None = True
+    elif args.single_host:
+        session_multi_host = False
+    else:
+        session_multi_host = None
+    session_top_hosts: int | None = args.top_hosts
     pending_objective = args.objective  # first-turn seed from CLI, if any
     is_first = True
 
@@ -1291,6 +1379,14 @@ def main():
             print(f"[+] Adversarial reviewer model set (sticky): {v}"
                   if v else "[+] Adversarial reviewer model cleared "
                             "(reuses main llm.model).")
+        if "multi_host" in overrides:
+            session_multi_host = bool(overrides["multi_host"])
+            print(f"[+] Multi-host mode "
+                  f"{'FORCED ON' if session_multi_host else 'FORCED OFF'} "
+                  "(sticky).")
+        if "top_hosts" in overrides:
+            session_top_hosts = int(overrides["top_hosts"])
+            print(f"[+] top_hosts set (sticky): {session_top_hosts}")
 
         # 3. If line was just flags (no objective text), re-prompt without exiting
         if not objective:
@@ -1318,6 +1414,13 @@ def main():
         if session_adversarial_model:
             adv_run["model"] = session_adversarial_model
         cfg_run["adversarial_review"] = adv_run
+        # Multi-host overrides
+        mh_run = dict(cfg.get("multi_host") or {})
+        if session_multi_host is not None:
+            mh_run["enabled"] = bool(session_multi_host)
+        if session_top_hosts is not None:
+            mh_run["top_n"] = int(session_top_hosts)
+        cfg_run["multi_host"] = mh_run
         # Resolve + print banner so the operator sees which backend/model runs.
         # Catch config errors (e.g. cloud without API key) so we don't leak
         # tracebacks and can re-prompt the user in the REPL.

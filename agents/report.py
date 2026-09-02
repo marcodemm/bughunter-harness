@@ -79,6 +79,36 @@ class ReportAgent(BaseAgent):
             )
         lines.append("")
 
+        # Subdomain prioritization (only if sub_prioritizer ran)
+        prioritized = s.get("prioritized_hosts") or []
+        if prioritized:
+            lines.append(f"## Subdomain Prioritization ({len(prioritized)} ranked)")
+            lines.append("")
+            lines.append("| # | Host | Score | Tier | Name | Status | Tech | Title | Ports |")
+            lines.append("|---|------|-------|------|------|--------|------|-------|-------|")
+            for i, p in enumerate(prioritized[:30], 1):
+                c = p.get("components", {})
+                lines.append(
+                    f"| {i} | `{p.get('host','')}` | {p.get('score','')} | "
+                    f"{p.get('tier','')} | {c.get('name',0)} | "
+                    f"{c.get('status',0)} | {c.get('tech',0)} | "
+                    f"{c.get('title',0)} | {c.get('ports',0)} |"
+                )
+            if len(prioritized) > 30:
+                lines.append(f"| … | (+{len(prioritized)-30} more) |")
+            # Whether multi-host mode was used
+            scanned_subs = sorted({
+                str(f.get("sub_scanned"))
+                for f in s.get("findings", [])
+                if f.get("sub_scanned")
+            })
+            if scanned_subs:
+                lines.append("")
+                lines.append(f"Multi-host mode was ON — scanned "
+                              f"{len(scanned_subs)} sub(s) in loop: "
+                              + ", ".join(f"`{h}`" for h in scanned_subs))
+            lines.append("")
+
         # Findings by severity
         findings = s.get("findings", [])
         by_sev = {}
@@ -90,15 +120,34 @@ class ReportAgent(BaseAgent):
             if not items:
                 continue
             lines.append(f"### {sev.upper()} ({len(items)})")
-            for f in items:
-                lines.append(f"- **{f['title']}**  ")
-                lines.append(f"  Agent: `{f['agent']}`")
-                if f.get("evidence"):
-                    ev = str(f["evidence"])[:600].replace("\n", " ")
-                    lines.append(f"  Evidence: `{ev}`")
-                if f.get("recommendation"):
-                    lines.append(f"  Recommendation: {f['recommendation']}")
-            lines.append("")
+            # If any finding in this severity has sub_scanned, group by sub
+            has_subs = any(f.get("sub_scanned") for f in items)
+            if has_subs:
+                by_sub: dict[str, list] = {}
+                for f in items:
+                    key = str(f.get("sub_scanned") or "(primary target)")
+                    by_sub.setdefault(key, []).append(f)
+                for sub, subitems in sorted(by_sub.items()):
+                    lines.append(f"#### On `{sub}` ({len(subitems)})")
+                    for f in subitems:
+                        lines.append(f"- **{f['title']}**  ")
+                        lines.append(f"  Agent: `{f['agent']}`")
+                        if f.get("evidence"):
+                            ev = str(f["evidence"])[:600].replace("\n", " ")
+                            lines.append(f"  Evidence: `{ev}`")
+                        if f.get("recommendation"):
+                            lines.append(f"  Recommendation: {f['recommendation']}")
+                    lines.append("")
+            else:
+                for f in items:
+                    lines.append(f"- **{f['title']}**  ")
+                    lines.append(f"  Agent: `{f['agent']}`")
+                    if f.get("evidence"):
+                        ev = str(f["evidence"])[:600].replace("\n", " ")
+                        lines.append(f"  Evidence: `{ev}`")
+                    if f.get("recommendation"):
+                        lines.append(f"  Recommendation: {f['recommendation']}")
+                lines.append("")
 
         if s.get("cves_matched"):
             lines.append("## CVE Matches")

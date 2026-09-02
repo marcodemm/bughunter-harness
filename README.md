@@ -2,7 +2,7 @@
 
 ![Bughunter Harness — a run that found a vulnerability](images/bughunter-harness-found-vuln.png)
 
-Autonomous local-LLM pentest agent. Multi-agent orchestrated pipeline (recon → fingerprint → content discovery → **login probe (lab only)** → web vuln scan (+ sqlmap + dalfox on parameterized endpoints) → wordpress → api fuzzer → auth → report → **adversarial review**) driven by any OpenAI-compatible LLM (LM Studio, Ollama, Llama.cpp, or a cloud provider). Rate-limited, scope-gated, redacted-by-default. Attribution headers, email + Telegram notifications, temp-file cleanup, and a live progress panel. **Drop-in extension framework** (`extensions/agents/*.py`, `extensions/tools/*.yaml`, `extensions/techniques/*.md`) — add a new pipeline stage, a new binary or a new playbook without touching core code.
+Autonomous local-LLM pentest agent. Multi-agent orchestrated pipeline (recon → **sub prioritizer** → fingerprint → content discovery → **login probe (lab only)** → web vuln scan (+ sqlmap + dalfox on parameterized endpoints) → wordpress → api fuzzer → auth → report → **adversarial review**) driven by any OpenAI-compatible LLM (LM Studio, Ollama, Llama.cpp, or a cloud provider). Rate-limited, scope-gated, redacted-by-default. Attribution headers, email + Telegram notifications, temp-file cleanup, and a live progress panel. **Multi-host mode** loops the scanning agents over the top-N ranked subs. **Drop-in extension framework** (`extensions/agents/*.py`, `extensions/tools/*.yaml`, `extensions/techniques/*.md`) — add a new pipeline stage, a new binary or a new playbook without touching core code.
 
 **Design goals** — safe by default (rate limit, scope allowlist, redact secrets, no destructive commands), model-agnostic, plug-and-play with the arsenal you already have on your machine.
 
@@ -244,9 +244,66 @@ Everything lives in `config.yaml`. Key sections:
 | `notify_only_if_findings` | Only send email + Telegram if run produced findings |
 | `cleanup_tempfiles` | Wipe `/tmp/harness-*` etc. after each run |
 | `adversarial_review.*` | Post-pipeline finding gate (see "Adversarial review" above) |
+| `multi_host.*` | Loop scan over top-N ranked subs (see "Multi-host mode" above) |
 | `extensions.*` | Drop-in extension framework toggle + extra_dirs (see "Extending" above) |
 
 See `config.example.yaml` inline comments for every field.
+
+---
+
+## Multi-host mode (loop scan over ranked subdomains)
+
+Default is single-host: the pipeline scans `state.live_hosts[0]` only. That's fine when your target is one URL, but on wildcard targets like `--scope "*.example.com"` you'd miss `admin.example.com` / `dev.example.com` / `api.example.com` etc.
+
+**Enable multi-host** with `--multi-host` (per run) or `multi_host.enabled: true` in `config.yaml`. The pipeline splits into 3 phases:
+
+- **Phase 1** (once): `recon → sub_prioritizer` (+ any non-repeated agent, e.g. an extension like `takeover`).
+- **Phase 2** (once per top-N sub): `fingerprint → content_discovery → login_probe → web_vuln → wordpress → api_fuzzer → auth`.
+- **Phase 3** (once): `report`.
+
+### `sub_prioritizer` — the ranker
+
+Deterministic (no LLM). Scores every `state.live_hosts` entry on 5 signals and reorders them so the juiciest sub is `[0]`:
+
+| Signal | Weight | Examples |
+|---|---|---|
+| **Name** (max of tokens) | up to **+40** | `admin/jenkins/gitlab/grafana/portainer/vault/adminer/phpmyadmin/k8s`=+40 · `dev/staging/qa/sandbox`=+35 · `api/graphql`=+30 · `internal/vpn/mgmt`=+25-30 · `mail/db/monitor`=+15-30 · `www/cdn/images`=+3-5 |
+| **HTTP status** | up to **+15** | 401/403 (auth-protected)=+15 · 5xx (server broken/exploitable)=+12 · 429=+8 · 2xx=+8 · 3xx=+5 · 404=-5 |
+| **Detected tech** | up to **+35** | jenkins/gitlab/grafana/adminer/portainer/dokploy/elasticsearch/vault/k8s-dashboard=+30-35 · wordpress/drupal/magento=+20-25 · nginx/apache=+3 |
+| **Title sniffing** | ±20 | `index of /`=+15 · `admin panel`=+12 · `login`=+8 · `for sale`/`parked`/`expired`/`suspended` → **HARD-CAP: total score ≤15 (LOW)** |
+| **Unusual ports** | up to +25 | 2375/2376 (Docker daemon)=+20 · 3306/5432/27017/6379 (DBs)=+15 · 9200 (Elasticsearch)=+12 · 8080/8443=+8 |
+| **Penalty** | -15 | Random hex label (≥16 chars) or UUID-like → -15 |
+
+**Tiers**: `≥60 CRITICAL` · `≥40 HIGH` · `≥20 MEDIUM` · `<20 LOW`.
+
+Findings from each per-sub pass are tagged `sub_scanned=<host>` and grouped per-subdomain in the REPORT.md's `## Findings` section.
+
+### Selection: `top_n` and `min_score`
+
+```yaml
+multi_host:
+  enabled: true
+  top_n: 3               # scan top-3 subs
+  min_score: 30          # only include subs with score >= 30
+                         # (falls back to top-N if nothing meets it)
+```
+
+Override per run: `--top-hosts 5` · `--multi-host` (force on) · `--single-host` (force off).
+
+### Cost
+
+**Linear in `top_n`.** With LM Studio + Qwen v8 bughunter, each per-sub pass is ~25-40 min. `top_n=3` ≈ 1h20m end-to-end. Speed knobs: `--skip-preflight`, `--no-adversarial`, lower `MAX_ITERATIONS` per agent in config.
+
+### Example
+
+```bash
+# Recon-first: see WHICH subs subfinder finds + how they rank
+python harness.py --scope "*.example.com" --objective "https://example.com/"
+
+# Read the "## Subdomain Prioritization" table in REPORT.md, then:
+python harness.py --multi-host --top-hosts 3 --scope "*.example.com" \
+                  --objective "https://example.com/"
+```
 
 ---
 
@@ -340,6 +397,7 @@ bughunter-harness/
 ├── agents/
 │   ├── base.py            BaseAgent (LLM ↔ tools loop)
 │   ├── recon.py
+│   ├── sub_prioritizer.py Deterministic sub ranker (5-signal heuristic)
 │   ├── fingerprint.py
 │   ├── content_discovery.py
 │   ├── login_probe.py     LAB-only default-cred probe → session_cookies

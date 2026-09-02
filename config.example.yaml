@@ -104,6 +104,47 @@ adversarial_review:
   # or set to the path of your own .md file with a custom rubric.
   prompt_template: "default"
 
+# ─────────── Multi-host mode (loop scan over ranked subs) ─────────
+# When enabled: after recon + sub_prioritizer rank state.live_hosts by
+# attack-surface priority (name / status / tech / title / port heuristic),
+# the pipeline runs fingerprint → content_discovery → login_probe →
+# web_vuln → wordpress → api_fuzzer → auth ONCE PER TOP-N SUB instead of
+# once against the primary target only.
+#
+# This is the difference between "scans www.target and misses admin.target
+# where the WP-admin actually lives" and "hits admin.target, dev.target,
+# api.target with full agent power".
+#
+# Findings from each per-sub pass are tagged with `sub_scanned` so the
+# REPORT.md can group them per host.
+#
+# Selection: top_n hosts by score. Optional min_score raises the bar (a
+# host below min_score is only scanned if fewer than top_n hosts meet it).
+#
+# Cost: LINEAR in top_n. Each per-sub pass is a full pipeline stage set.
+# Rule of thumb with LM Studio + Qwen v8: ~25-40 min for top_n=1 →
+# ~1h20m for top_n=3. Use --no-adversarial and --skip-preflight for speed.
+#
+# Override per-run with CLI/REPL flags:
+#   --multi-host          → force enabled=true for this run
+#   --single-host         → force enabled=false for this run
+#   --top-hosts N         → override top_n
+multi_host:
+  enabled: false               # default off (single-host = fastest single-run)
+  top_n: 3                     # scan top-3 prioritized subs
+  min_score: 30                # only include subs with score >= 30
+                               # (falls back to top_n if nothing meets it)
+  # Agents that run ONCE PER SUB in the loop. `recon` and `sub_prioritizer`
+  # always run once (pre-loop). `report` always runs once (post-loop).
+  agents_to_repeat:
+    - fingerprint
+    - content_discovery
+    - login_probe
+    - web_vuln
+    - wordpress
+    - api_fuzzer
+    - auth
+
 # ─────────── Extension framework (drop-in add-ons) ─────────────────
 # The harness auto-discovers plugins under extensions/ at startup:
 #   extensions/agents/*.py       → BaseAgent subclasses inserted into the

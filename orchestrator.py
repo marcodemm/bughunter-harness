@@ -40,6 +40,7 @@ from agents.fingerprint import FingerprintAgent
 from agents.login_probe import LoginProbeAgent
 from agents.recon import ReconAgent
 from agents.report import ReportAgent
+from agents.sub_prioritizer import SubPrioritizerAgent
 from agents.web_vuln import WebVulnAgent
 from agents.wordpress import WordPressAgent
 from shared_state import SharedState
@@ -50,13 +51,14 @@ from adversarial_reviewer import AdversarialReviewer
 from ui import MultiAgentUI
 
 
-# Order matters — login_probe runs BEFORE web_vuln so its captured cookie
-# is auto-injected into the sqlmap/dalfox/nuclei calls that follow. It also
-# runs BEFORE a second (implicit) content_discovery pass, but we don't
-# re-run content_discovery — instead it's given a cookie note upfront and
-# an "if a cookie appears later, use it" instruction (see agent prompt).
+# Order matters:
+#   - sub_prioritizer runs right after recon (ranks state.live_hosts so
+#     the rest of the pipeline sees the juiciest sub at [0]);
+#   - login_probe runs BEFORE web_vuln so its captured cookie is
+#     auto-injected into the sqlmap/dalfox/nuclei calls that follow.
 AGENT_ORDER = [
     ReconAgent,
+    SubPrioritizerAgent,   # deterministic ranker — reorders live_hosts
     FingerprintAgent,
     ContentDiscoveryAgent,
     LoginProbeAgent,       # lab-only default-creds → session_cookies
@@ -65,6 +67,19 @@ AGENT_ORDER = [
     ApiFuzzerAgent,
     AuthAgent,
     ReportAgent,
+]
+
+# Agents repeated once per prioritized sub in multi-host mode. Everything
+# up to (and including) sub_prioritizer runs ONCE against the primary target;
+# these run again per selected sub; ReportAgent runs ONCE at the end.
+_MULTI_HOST_REPEATED_DEFAULT = [
+    "fingerprint",
+    "content_discovery",
+    "login_probe",
+    "web_vuln",
+    "wordpress",
+    "api_fuzzer",
+    "auth",
 ]
 
 
@@ -161,33 +176,14 @@ class Orchestrator:
             self.state.error("orchestrator",
                              f"target unreachable pre-flight: {reason}")
 
+        mh_cfg = self.cfg.get("multi_host") or {}
+        multi_host_enabled = bool(mh_cfg.get("enabled", False))
+
         with MultiAgentUI(self.agent_names) as ui:
-            for AgentCls in self.agent_order:
-                # If pre-flight failed, skip everything except the report agent
-                if self.state.get("target_unreachable") and \
-                   AgentCls is not ReportAgent:
-                    ui.hook(AgentCls.NAME, "skipped",
-                            reason="target unreachable")
-                    self.state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
-                    ui.notify(f"skipped {AgentCls.NAME} (target unreachable)")
-                    continue
-                agent = AgentCls(cfg=self.cfg, tool_registry=self.tools,
-                                 run_dir=self.run_dir, progress_hook=ui.hook)
-                # Pre-check: skip cheaply if entry condition false
-                if not agent.entry_condition(self.state):
-                    ui.hook(agent.NAME, "skipped",
-                            reason="entry condition false")
-                    self.state.mark_agent_run(agent.NAME, "skipped", 0.0)
-                    ui.notify(f"skipped {agent.NAME}")
-                    continue
-                ui.notify(f"starting {agent.NAME}")
-                try:
-                    result = agent.run(self.state)
-                    ui.notify(f"{agent.NAME} → {result}")
-                except Exception as e:
-                    self.state.error(agent.NAME, str(e))
-                    ui.hook(agent.NAME, "error", err=str(e))
-                    ui.notify(f"{agent.NAME} raised: {e}")
+            if multi_host_enabled and not self.state.get("target_unreachable"):
+                self._run_multi_host(mh_cfg, ui)
+            else:
+                self._run_single_host(ui)
 
         elapsed = int(time.time() - self.started)
         print(f"[+] Pipeline complete in {elapsed}s. "
@@ -260,6 +256,171 @@ class Orchestrator:
             except Exception as e:
                 last_err = f"{type(e).__name__}: {str(e)[:120]}"
         return False, last_err
+
+    # ── single-host pipeline (default) ──────────────────────────────
+    def _run_single_host(self, ui) -> None:
+        for AgentCls in self.agent_order:
+            self._run_one_agent(AgentCls, self.state, ui)
+
+    # ── multi-host pipeline ─────────────────────────────────────────
+    def _run_multi_host(self, mh_cfg: dict, ui) -> None:
+        """Run the pipeline in 3 phases against ranked subs:
+
+          Phase 1 (once, on primary target):
+              recon → sub_prioritizer → (any extension agent NOT in the
+              repeated set, e.g. `takeover` — which itself iterates subs)
+          Phase 2 (repeated, once per top-N sub):
+              fingerprint → content_discovery → login_probe → web_vuln →
+              wordpress → api_fuzzer → auth
+          Phase 3 (once, at the end):
+              report
+
+        Selection of subs to loop over: top_n hosts from
+        `state.prioritized_hosts`, filtered by min_score. If no host meets
+        min_score, we still loop the top_n (better to scan something than
+        nothing). If sub_prioritizer didn't run (single live host), we
+        fall back to single-host mode automatically."""
+        top_n = int(mh_cfg.get("top_n", 3))
+        min_score = int(mh_cfg.get("min_score", 30))
+        repeated_names = set(mh_cfg.get(
+            "agents_to_repeat", _MULTI_HOST_REPEATED_DEFAULT))
+        pre_phase_names = {ReportAgent.NAME}
+
+        # ── PHASE 1 ────────────────────────────────────────────────
+        for AgentCls in self.agent_order:
+            name = getattr(AgentCls, "NAME", "")
+            if name in repeated_names or name in pre_phase_names:
+                continue
+            self._run_one_agent(AgentCls, self.state, ui)
+
+        # ── Select subs to loop over ───────────────────────────────
+        prioritized = self.state.get("prioritized_hosts") or []
+        if not prioritized:
+            # sub_prioritizer skipped (only 1 live host) → single-host loop
+            ui.notify("multi-host: only 1 live host, falling back to single-host")
+            for AgentCls in self.agent_order:
+                name = getattr(AgentCls, "NAME", "")
+                if name in repeated_names:
+                    self._run_one_agent(AgentCls, self.state, ui)
+            # report
+            for AgentCls in self.agent_order:
+                if AgentCls is ReportAgent:
+                    self._run_one_agent(AgentCls, self.state, ui)
+                    break
+            return
+
+        selected = [p for p in prioritized[:top_n] if p["score"] >= min_score]
+        if not selected:
+            # Nothing meets min_score — better to loop top-N than nothing
+            selected = prioritized[:top_n]
+        ui.notify(f"multi-host: iterating {len(selected)} sub(s) "
+                  f"(top_n={top_n}, min_score={min_score})")
+
+        # ── PHASE 2 ────────────────────────────────────────────────
+        for i, host_pri in enumerate(selected):
+            self._loop_repeated_agents_on_sub(
+                host_pri=host_pri, repeated_names=repeated_names,
+                ui=ui, index=i, total=len(selected))
+
+        # ── PHASE 3 ────────────────────────────────────────────────
+        for AgentCls in self.agent_order:
+            if AgentCls is ReportAgent:
+                self._run_one_agent(AgentCls, self.state, ui)
+                break
+
+    def _loop_repeated_agents_on_sub(self, host_pri: dict,
+                                       repeated_names: set,
+                                       ui, index: int, total: int) -> None:
+        """Run every agent whose NAME is in `repeated_names` against a
+        single sub. Preserves the original global state around the pass:
+
+          - snapshot `target`, `live_hosts`, `endpoints_found`, `detected_techs`
+          - narrow state.live_hosts to [this_sub_record] + set state.target
+          - reset endpoints_found so content_discovery works on this sub only
+          - run each repeated agent in order
+          - tag every finding added during the pass with sub_scanned=<host>
+          - restore global state (merging endpoints + techs) so the next
+            sub starts clean but nothing is lost from prior passes
+        """
+        host = str(host_pri.get("host", ""))
+        if not host:
+            return
+
+        # Rebuild the URL for this sub. Prefer the scheme discovered by httpx,
+        # fall back to https.
+        orig_live = list(self.state.get("live_hosts") or [])
+        this_record = next(
+            (h for h in orig_live if str(h.get("host", "")) == host),
+            {"host": host, "scheme": "https"})
+        scheme = this_record.get("scheme", "https") or "https"
+        sub_url = f"{scheme}://{host}"
+        ui.notify(f"── multi-host {index+1}/{total}: {sub_url} "
+                  f"(score={host_pri.get('score')} "
+                  f"tier={host_pri.get('tier','?')}) ──")
+
+        # Snapshot state we're about to override
+        orig_target = self.state.get("target")
+        orig_endpoints = list(self.state.get("endpoints_found") or [])
+        orig_techs = list(self.state.get("detected_techs") or [])
+        findings_before = len(self.state.get("findings") or [])
+
+        # Override for the pass
+        self.state.set("target", sub_url)
+        self.state.set("live_hosts", [this_record])
+        self.state.set("endpoints_found", [])
+        # Seed detected_techs with this sub's tech only (fingerprint will refill)
+        seed_techs = this_record.get("tech") or this_record.get("technologies") or []
+        self.state.set("detected_techs",
+                        sorted({str(t).lower() for t in seed_techs}))
+
+        try:
+            for AgentCls in self.agent_order:
+                if getattr(AgentCls, "NAME", "") in repeated_names:
+                    self._run_one_agent(AgentCls, self.state, ui)
+        finally:
+            # Tag findings added during this pass with sub_scanned=host
+            all_findings = list(self.state.get("findings") or [])
+            for f in all_findings[findings_before:]:
+                # Mutating dicts in-place is fine — they came from state.append
+                f["sub_scanned"] = host
+            # Restore global target + live_hosts; MERGE endpoints + techs
+            self.state.set("target", orig_target)
+            self.state.set("live_hosts", orig_live)
+            merged_endpoints = list(orig_endpoints)
+            seen_urls = {e.get("url") for e in merged_endpoints if e.get("url")}
+            for e in (self.state.get("endpoints_found") or []):
+                if e.get("url") and e.get("url") not in seen_urls:
+                    merged_endpoints.append(e)
+                    seen_urls.add(e.get("url"))
+            self.state.set("endpoints_found", merged_endpoints)
+            merged_techs = sorted({*orig_techs,
+                                    *(self.state.get("detected_techs") or [])})
+            self.state.set("detected_techs", merged_techs)
+
+    def _run_one_agent(self, AgentCls, state, ui) -> None:
+        """Instantiate + run a single agent, honouring pre-flight abort +
+        entry_condition + catching errors. Shared body of the single-host
+        loop AND the multi-host per-sub loop."""
+        if state.get("target_unreachable") and AgentCls is not ReportAgent:
+            ui.hook(AgentCls.NAME, "skipped", reason="target unreachable")
+            state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
+            ui.notify(f"skipped {AgentCls.NAME} (target unreachable)")
+            return
+        agent = AgentCls(cfg=self.cfg, tool_registry=self.tools,
+                         run_dir=self.run_dir, progress_hook=ui.hook)
+        if not agent.entry_condition(state):
+            ui.hook(agent.NAME, "skipped", reason="entry condition false")
+            state.mark_agent_run(agent.NAME, "skipped", 0.0)
+            ui.notify(f"skipped {agent.NAME}")
+            return
+        ui.notify(f"starting {agent.NAME}")
+        try:
+            result = agent.run(state)
+            ui.notify(f"{agent.NAME} → {result}")
+        except Exception as e:
+            state.error(agent.NAME, str(e))
+            ui.hook(agent.NAME, "error", err=str(e))
+            ui.notify(f"{agent.NAME} raised: {e}")
 
     def _maybe_run_adversarial_review(self) -> None:
         """Run adversarial reviewer over findings (if enabled) and
