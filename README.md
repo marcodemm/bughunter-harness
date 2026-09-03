@@ -335,9 +335,9 @@ When the quick pass finishes, the orchestrator evaluates **escalate criteria** a
 
 If any criterion fires:
 
-- With `--auto-escalate` → escalates automatically
-- Otherwise → prompts `[y/N]` with a 30 s timeout (any other answer / timeout / non-TTY = declined)
-- With `--no-escalate` → never escalates; REPORT.md gets an `💡 Escalate suggested` block with the reasons
+- **DEFAULT** (`quick_mode.auto_escalate: true` in config) → escalates automatically, no prompt.
+- With `quick_mode.auto_escalate: false` in config → prompts `[y/N]` with a 30 s timeout (any other answer / timeout / non-TTY = declined).
+- With `--no-escalate` (or `quick_mode.auto_escalate: false` + timeout) → REPORT.md gets an `💡 Escalate suggested` block with the reasons — you can re-run with `--complete` later.
 
 When escalated, the previously-skipped agents (`login_probe`, `wordpress`, `api_fuzzer`, `auth` + `adversarial-review`) run on the accumulated `state` — no wasted work.
 
@@ -347,8 +347,8 @@ When escalated, the previously-skipped agents (`login_probe`, `wordpress`, `api_
 |---|---|
 | `--complete` | Force full pipeline for this run (skip quick entirely) |
 | `--quick` | Force quick even if disabled in config |
-| `--auto-escalate` | Escalate on criteria fire without prompting |
-| `--no-escalate` | Never escalate; leave "Escalate suggested" in REPORT.md |
+| `--auto-escalate` | Force auto-escalate for this run (redundant with the default — useful only when config has `auto_escalate: false`) |
+| `--no-escalate` | Never escalate for this run; always leave "Escalate suggested" in REPORT.md (wins over `auto_escalate`) |
 
 Config in [`config.example.yaml → quick_mode:`](config.example.yaml).
 
