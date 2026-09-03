@@ -192,18 +192,25 @@ Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH
 ![Bughunter Harness command-line interface — pipeline complete](images/application-command-line-interface-end.png)
 *Pipeline complete — every agent's final status, elapsed time and note.*
 
-The orchestrator will run the 9 agents in sequence and produce a `sessions/<run-id>/REPORT.md` at the end.
+The orchestrator will run the 10 core agents (+ any extension) in sequence and produce a `sessions/<run-id>/REPORT.md` at the end.
 
-**Pipeline (order matters — cookies from step 4 feed into step 5):**
-1. `recon` — subdomain + host + port enumeration
-2. `fingerprint` — tech-stack detection
-3. `content_discovery` — hidden paths + historical URLs (adds `-H "Cookie: …"` if step 4 already captured one; usually it hasn't yet on first pass)
-4. `login_probe` — **LAB ONLY** (localhost / private IP / DVWA / Juice Shop / Mutillidae / bWAPP / WebGoat) — tries 6 stock default-cred pairs (`admin:password`, `admin:admin`, …), harvests the session cookie into `state.session_cookies`
-5. `web_vuln` — nuclei + nikto + **sqlmap** and **dalfox** against parameterized endpoints, with the cookie from step 4 auto-injected
-6. `wordpress` — wpscan (if WordPress detected)
-7. `api_fuzzer` — API surface + BOLA/BFLA hints
-8. `auth` — auth-bypass + SSO/OAuth misconfig
-9. `report` — deterministic Markdown consolidator
+**Pipeline (order matters — cookies from `login_probe` feed into `web_vuln`):**
+1. `recon` — subdomain + host + port enumeration + free Shodan InternetDB enrichment per live IP
+2. `sub_prioritizer` — deterministic 6-signal ranker; reorders `state.live_hosts` so the juiciest sub is `[0]` (see "Multi-host mode" below)
+3. `fingerprint` — tech-stack detection
+4. `content_discovery` — hidden paths + historical URLs (adds `-H "Cookie: …"` if `login_probe` already captured one; usually it hasn't yet on first pass)
+5. `login_probe` — **LAB ONLY** (localhost / private IP / DVWA / Juice Shop / Mutillidae / bWAPP / WebGoat) — tries 6 stock default-cred pairs (`admin:password`, `admin:admin`, …), harvests the session cookie into `state.session_cookies`
+6. `web_vuln` — nuclei + nikto + **sqlmap** and **dalfox** against parameterized endpoints, with the cookie from step 5 auto-injected
+7. `wordpress` — wpscan JSON + WPScan CVE-DB cross-match (if WordPress detected; see "WPScan API" below)
+8. `api_fuzzer` — API surface + BOLA/BFLA hints
+9. `auth` — auth-bypass + SSO/OAuth misconfig
+10. `report` — deterministic Markdown consolidator (+ auto post-run `adversarial_review` unless quick mode)
+
+Extension agents (drop-in under `extensions/agents/*.py`) splice themselves according to their `ENTRY_AFTER` — the shipped `example_takeover.py` runs right after `recon` and checks every discovered sub for dangling CNAMEs.
+
+**Quick mode is ON by default** — the pipeline runs a fast triage pass first (skips `login_probe`, `wordpress`, `api_fuzzer`, `auth` + adversarial review) and, if signal is found, auto-escalates to the full set. See "Quick mode" below for the full flow.
+
+**REPL guard** — the objective prompt catches typos of `/quit`, `/bye`, `/exit` (via Damerau-Levenshtein distance 1 — e.g. `by`, `quti`, `exti`) and validates that your input looks like a scannable target (URL / host with TLD / IP / CIDR / wildcard) or a ≥4-word natural-language objective. It prints an inline command reference on any unrecognized input instead of starting a scan against garbage.
 
 **Full help** (all flags and behaviours):
 ```bash
@@ -241,7 +248,7 @@ Everything lives in `config.yaml`. Key sections:
 |---|---|
 | `llm.*` | LLM backend + model + API key |
 | `min_request_interval_sec` | Global rate limit (default 1 req/s) |
-| `shell_timeout_sec` | Per-command timeout (default 300 s) |
+| `shell_timeout_sec` | Per-command timeout (default 900 s — nuclei/wpscan full scans need it) |
 | `custom_headers` | HTTP headers attached to every request (attribution) |
 | `scope_file` / `scope_enforcement` | In-scope allowlist file + mode (strict/warn/off) |
 | `oob_host` | Your self-hosted OOB catcher (for blind vuln PoCs) |
@@ -273,16 +280,18 @@ Default is single-host: the pipeline scans `state.live_hosts[0]` only. That's fi
 
 ### `sub_prioritizer` — the ranker
 
-Deterministic (no LLM). Scores every `state.live_hosts` entry on 5 signals and reorders them so the juiciest sub is `[0]`:
+Deterministic (no LLM). Scores every `state.live_hosts` entry on 6 signals and reorders them so the juiciest sub is `[0]`:
 
 | Signal | Weight | Examples |
 |---|---|---|
-| **Name** (max of tokens) | up to **+40** | `admin/jenkins/gitlab/grafana/portainer/vault/adminer/phpmyadmin/k8s`=+40 · `dev/staging/qa/sandbox`=+35 · `api/graphql`=+30 · `internal/vpn/mgmt`=+25-30 · `mail/db/monitor`=+15-30 · `www/cdn/images`=+3-5 |
+| **Name** (max of tokens) | up to **+40** | `admin/jenkins/gitlab/grafana/portainer/vault/adminer/phpmyadmin/k8s`=+40 · `dev/staging/qa/sandbox`=+35 · `api/graphql`=+30 · `internal/vpn/mgmt`=+25-30 · `mail/db/monitor`=+15-30 · `www/cdn/images`=+3-5 · negative for third-party managed hosts (`clerk`, `firebaseapp`, `netlify`, `vercel`, `githubusercontent` → -5 to -10) |
 | **HTTP status** | up to **+15** | 401/403 (auth-protected)=+15 · 5xx (server broken/exploitable)=+12 · 429=+8 · 2xx=+8 · 3xx=+5 · 404=-5 |
 | **Detected tech** | up to **+35** | jenkins/gitlab/grafana/adminer/portainer/dokploy/elasticsearch/vault/k8s-dashboard=+30-35 · wordpress/drupal/magento=+20-25 · nginx/apache=+3 |
 | **Title sniffing** | ±20 | `index of /`=+15 · `admin panel`=+12 · `login`=+8 · `for sale`/`parked`/`expired`/`suspended` → **HARD-CAP: total score ≤15 (LOW)** |
 | **Unusual ports** | up to +25 | 2375/2376 (Docker daemon)=+20 · 3306/5432/27017/6379 (DBs)=+15 · 9200 (Elasticsearch)=+12 · 8080/8443=+8 |
+| **Shodan InternetDB** (free enrichment — see "Shodan integration") | up to +30 | Known CVE match=+25 · juicy tag (`admin_panel`/`database`/`iot`/`vpn`/`docker`)=+15 · rare port open (Redis/Mongo/Elastic/Docker/Kibana)=+10 |
 | **Penalty** | -15 | Random hex label (≥16 chars) or UUID-like → -15 |
+| **Anti-bot challenge** | -30 | Cloudflare/DataDome/PerimeterX/Sucuri challenge page detected — non-browser tools can't pass, wastes multi-host budget |
 
 **Tiers**: `≥60 CRITICAL` · `≥40 HIGH` · `≥20 MEDIUM` · `<20 LOW`.
 
@@ -527,6 +536,8 @@ Extensions are pure additions: they never modify or shadow core behaviour. A mal
 - **Output redaction** — `redact.py` scrubs JWT / AWS keys / GitHub tokens / cookies / emails from every tool output before it reaches the model or the report.
 - **Pre-flight reachability check** — the orchestrator sends a single HTTP GET to the target before spawning any agent. By default (soft-warn) a failure is a `⚠️ Pre-flight warning` banner and the pipeline continues — the agents' Go/curl-based tools use different TLS/HTTP stacks than python-requests and often pass where the probe hits JA3/JA4 blocking or a fussy handshake. Pass `--strict-preflight` (or `preflight.strict: true` in config) to abort instead — REPORT.md then carries a `🚨 TARGET UNREACHABLE` banner and no LLM turns burn against a dead host. Pass `--skip-preflight` to not probe at all.
 - **Cleanup** — temp files created by the agents (`/tmp/harness-*`, `/tmp/gau_*`, `/tmp/nuclei_*`, …) are wiped after each run.
+- **Meta-check warnings in REPORT.md** — a `⚠️ Meta-check warnings` block is prepended to the executive summary whenever the pipeline hit a class of plumbing issue: WordPress detected but `wpscan` missing (with install command), WPScan API daily quota exhausted, Shodan Pro credits exhausted, 3+ shell timeouts (suggests raising `shell_timeout_sec`), 3+ denylist rejections (LLM tried `&`/`$( )`/backticks — see the substitute cheat-sheet in the base prompt), `live_hosts=0` with an HTTP target, or 0 findings after >10 min of run time. Each warning tells the operator exactly WHY the pipeline lost signal, distinguishing "target is genuinely clean" from "our plumbing dropped data".
+- **Nuclei JSONL sink + metrics** — every nuclei call the agents run writes to `/tmp/harness-nuclei-*.jsonl` (deterministic output independent of stdout truncation). The parser logs `total_lines=N json_records=M → findings_added=X` so you can tell the difference between "nuclei found nothing" and "nuclei found 40 things but all got filtered as info/-detect".
 
 ---
 
@@ -589,7 +600,7 @@ bughunter-harness/
 - **"Cloud backend selected but no API key found"** — set `llm.api_key` in `config.yaml` or export the backend's default env var (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NVIDIA_API_KEY`, `GEMINI_API_KEY`).
 - **"Local SMTP relay not reachable at 127.0.0.1:25"** — either configure a real SMTP provider or install Mailpit (see §6 above).
 - **"Model returned no tool call after 3 retries"** — enable "Tool Use" in your LM Studio model settings, or switch to `tool_choice: "auto"` in `config.yaml`.
-- **"command timed out after 300s"** — raise `shell_timeout_sec` in `config.yaml`, or tell the model to reduce scope (fewer nuclei tags, smaller wordlist).
+- **"command timed out after 900s"** — the default is already `shell_timeout_sec: 900` (15 min) which suits nuclei/wpscan full scans. If a scan still times out, either reduce scope (narrow nuclei to tech-specific tags like `-tags cve,wordpress` instead of `-tags cve` alone, smaller wordlist) or raise the timeout further in `config.yaml`.
 - **`ffuf` fails with "wordlist not found"** — install SecLists (see §5 above).
 - **`bash: nuclei: command not found`** — install the offensive tools (see §4 above).
 - **`bash: sqlmap: command not found` / `bash: dalfox: command not found`** — install them: `brew install sqlmap` + `go install github.com/hahwul/dalfox/v2@latest` (Linux: `sudo apt install sqlmap`). Without them the `web_vuln` agent skips step 6 (active parameter injection) and you will miss SQLi / XSS in custom code.
