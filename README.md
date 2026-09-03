@@ -249,9 +249,11 @@ Everything lives in `config.yaml`. Key sections:
 | `telegram.*` | Telegram bot token + chat_id |
 | `notify_only_if_findings` | Only send email + Telegram if run produced findings |
 | `cleanup_tempfiles` | Wipe `/tmp/harness-*` etc. after each run |
-| `adversarial_review.*` | Post-pipeline finding gate (see "Adversarial review" above) |
-| `multi_host.*` | Loop scan over top-N ranked subs (see "Multi-host mode" above) |
-| `extensions.*` | Drop-in extension framework toggle + extra_dirs (see "Extending" above) |
+| `adversarial_review.*` | Post-pipeline finding gate (see "Adversarial review" below) |
+| `multi_host.*` | Loop scan over top-N ranked subs (see "Multi-host mode" below) |
+| `wpscan.*` | WPScan Vulnerability DB API token (see "WPScan API" below) |
+| `shodan.*` | Shodan free InternetDB + optional Pro API (see "Shodan integration" below) |
+| `extensions.*` | Drop-in extension framework toggle + extra_dirs (see "Extending" below) |
 
 See `config.example.yaml` inline comments for every field.
 
@@ -373,6 +375,121 @@ Findings that fail even one question are moved out of the notification path — 
 **Fail-open**: if the reviewer LLM is down, findings pass through ungated rather than get silently lost.
 
 Configure in [`config.example.yaml`](config.example.yaml) → `adversarial_review:` section. Disable with `enabled: false` or CLI `--no-adversarial`.
+
+---
+
+## WPScan API — WordPress Vulnerability DB integration
+
+The `wordpress` agent uses [WPScan](https://wpscan.com/) to enumerate plugins, themes and users, and — when an **API token** is configured — to cross-match every detected version against the [WPScan Vulnerability Database](https://wpscan.com/wordpresses/) for known CVEs. Without a token, wpscan still enumerates plugins/versions but returns **0 CVE matches** even when a plugin is outdated.
+
+**Free tier**: 25 requests/day. Register at https://wpscan.com/register.
+
+**Configure in `config.yaml`:**
+
+```yaml
+wpscan:
+  api_token: "PASTE_YOUR_TOKEN_HERE"     # direct value (higher precedence)
+  api_token_env: "WPSCAN_API_TOKEN"      # env var fallback if api_token empty
+```
+
+Or export the env var:
+
+```bash
+export WPSCAN_API_TOKEN='your_token_here'
+```
+
+**Injection mechanics**: on `build_objective`, the wordpress agent reads the resolved token and exports it to `os.environ["WPSCAN_API_TOKEN"]` so every subprocess it spawns inherits it. The system prompt tells the LLM to append `--api-token "$WPSCAN_API_TOKEN"` to wpscan commands ONLY when the objective says `WPScan API token: available` (passing an empty `--api-token` value makes wpscan exit with an error).
+
+### Quota-exhausted auto-fallback (session-sticky)
+
+The free tier's 25/day limit is easy to hit on multi-host runs. When the wordpress agent detects any of these markers in a wpscan response:
+
+- `daily limit`
+- `You have reached the maximum`
+- `API request limit reached`
+- `reached the daily`
+
+…it flags `state.wpscan_api_exhausted = True` for the rest of the session. The next call to `build_objective` un-exports the env var → the LLM sees `WPScan API token: EXHAUSTED (daily limit reached)` and OMITs the `--api-token` flag automatically. **No manual intervention.** Plugin/theme/user enumeration still runs; only the CVE-DB cross-match is disabled until the quota resets (midnight UTC) or you upgrade the plan.
+
+The final REPORT.md includes a `⚠️ Meta-check warnings` block explaining exactly what happened so you know why any HIGH/CRITICAL plugin CVE was missed.
+
+### wpscan output → structured findings
+
+The agent runs wpscan with `--format json -o /tmp/harness-wpscan.json` and parses the JSON deterministically. Each plugin/theme vulnerability becomes a `finding` entry with:
+
+- Severity mapped from CVSS (`>=9.0 critical`, `>=7.0 high`, `>=4.0 medium`, `>0 low`)
+- Title, evidence line (product/version/target/CVSS/fixed_in)
+- CVE identifiers (linked to NVD in the recommendation)
+- Direct upgrade recommendation (`Upgrade <slug> to >= <fixed_in>`)
+
+Plugins detected without matching CVEs still appear as INFO entries — useful audit trail of what was enumerated.
+
+**Installation**: `gem install wpscan` (needs Ruby). On macOS: `brew install ruby && gem install wpscan` — you may need to add the gem bin dir to PATH (`ls /opt/homebrew/lib/ruby/gems/*/bin/wpscan` — symlink to `/opt/homebrew/bin/wpscan` if not already there).
+
+---
+
+## Shodan integration (free InternetDB + optional Pro)
+
+Two-tier Shodan enrichment. **Tier 1 (InternetDB)** runs automatically on every scan for zero cost. **Tier 2 (Pro search)** is opt-in with a hard throttle to protect your quota.
+
+### Tier 1 — InternetDB (free, no key, always on)
+
+The `recon` agent resolves each `live_host` to its IP and hits `https://internetdb.shodan.io/<ip>` — [Shodan's free open-data service](https://internetdb.shodan.io/) covering ~9M internet-exposed hosts. No API key required, no per-account rate limit. Each host record gets enriched with:
+
+- Open ports
+- Known CVEs (from Shodan's vulnerability index)
+- Tags (`admin`, `database`, `iot`, `vpn`, `cctv`, `ics`, `docker`, `kubernetes`, …)
+- Alternative hostnames
+- CPEs
+
+The `sub_prioritizer` picks these up as a **6th signal** and bumps scores:
+
+| Signal | Weight |
+|---|---|
+| Known CVE match (proof of vuln — no probing needed) | **+25** |
+| Juicy tag (admin_panel / database / iot / vpn / cctv / ics / docker) | **+15** |
+| Rare service port open (Redis 6379 / Mongo 27017 / Elastic 9200 / MySQL 3306 / Postgres 5432 / Docker 2375 / Kibana 5601) | **+10** |
+
+Cap +30 total so one super-juicy Shodan record can't dominate. The full breakdown surfaces in the REPORT.md `## Shodan InternetDB Enrichment` section (per-host: ports / CVEs / tags / CPEs / hostnames).
+
+Disable with `shodan.internetdb_enabled: false`.
+
+### Tier 2 — Shodan Pro search (paid, quota-throttled)
+
+When you configure a Shodan Pro API key, the LLM gains a `shodan_search(query, limit)` tool for pivots that InternetDB can't answer:
+
+- `http.favicon.hash:-1234567890` — asset discovery by favicon
+- `org:"Target Inc"` — every host in the target's org
+- `ssl.jarm:xxxxx` — JARM fingerprint pivot
+- `product:jenkins country:US` — product + geo filters
+- Cert SAN searches, HTTP title regex, …
+
+**Configure in `config.yaml`:**
+
+```yaml
+shodan:
+  api_key: ""                          # your Pro key (or leave empty and use env)
+  api_key_env: "SHODAN_API_KEY"        # env var fallback
+  max_pro_calls_per_run: 2             # HARD throttle — LLM can't bypass
+  internetdb_enabled: true             # Tier 1 stays on regardless
+```
+
+Register a Pro plan at https://account.shodan.io.
+
+### Quota-exhausted auto-fallback (session-sticky)
+
+Shodan Pro has a monthly query quota. When `_shodan_search` detects:
+
+- HTTP 402 (no credits)
+- HTTP 200/4xx body containing `no query credits`, `insufficient credits`, `monthly query limit`, `quota exceeded`
+
+…it flags `self.shodan_pro_exhausted = True` for the rest of the session. Subsequent `shodan_search` calls short-circuit to `ERROR: Shodan Pro credits exhausted` without spending another attempt. The LLM sees the error and falls back to `shodan_internetdb` (still free, still working).
+
+The final REPORT.md's `⚠️ Meta-check warnings` block explains it happened and points to `https://account.shodan.io` for top-up.
+
+### Throttle guarantee
+
+`max_pro_calls_per_run` is enforced in `ToolRegistry`, not in the prompt — the LLM CANNOT bypass it. Once the counter hits the limit, every subsequent `shodan_search` returns `ERROR: Shodan Pro throttle exhausted for this run` and points the agent to InternetDB.
 
 ---
 
