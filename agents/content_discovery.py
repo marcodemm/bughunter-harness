@@ -152,17 +152,45 @@ Rules:
         found: set[str] = set()
         dropped_off_scope = 0
         dropped_invalid = 0
+        dropped_truncated = 0
+
+        # N8 fix (2026-09-03): drop URLs that look TRUNCATED by an upstream
+        # pipeline (e.g. `awk -F/ '{print $1,$2,$3,$4}'` on gau output
+        # produces `.../analisis-impacto-` — a path ending in a dash with
+        # no extension / no query params. Downstream fuzzer/scanner would
+        # waste requests on nonsense.
+        def _looks_truncated(u: str) -> bool:
+            try:
+                p = _up(u)
+            except Exception:
+                return True
+            path = p.path or ""
+            if not path or path == "/":
+                return False  # bare root is fine
+            # Trailing dash/underscore: probably truncated
+            if path.rstrip().endswith(("-", "_")):
+                return True
+            return False
+
         for entry in transcript:
             result = str(entry.get("result", ""))
             for m in re.finditer(r"https?://[^\s\"'<>]+", result):
-                u = m.group(0)
+                u = m.group(0).rstrip(".,;:'\"")  # trim trailing punctuation
                 if not _is_valid_url(u):
                     dropped_invalid += 1
+                    continue
+                if _looks_truncated(u):
+                    dropped_truncated += 1
                     continue
                 if _in_scope(u):
                     found.add(u)
                 else:
                     dropped_off_scope += 1
+        if dropped_truncated:
+            state.log(self.NAME, "info",
+                      f"dropped {dropped_truncated} truncated URLs "
+                      f"(trailing dash/underscore — likely awk|cut pipeline "
+                      f"cut them mid-slug)")
         if dropped_off_scope:
             state.log(self.NAME, "info",
                       f"dropped {dropped_off_scope} URLs from other domains "

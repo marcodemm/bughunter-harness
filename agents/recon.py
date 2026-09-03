@@ -163,13 +163,14 @@ Rules:
             state.extend("subdomains", sorted(subs))
         if live:
             state.extend("live_hosts", live)
-            # Propagate tech hints from httpx directly
+            # Propagate tech hints from httpx directly, dedup + sanity-check
             techs: set[str] = set()
             for h in live:
                 for t in h.get("tech", []) or []:
                     techs.add(str(t).lower())
             if techs:
-                state.extend("detected_techs", sorted(techs))
+                cleaned = _normalize_and_dedup_techs(techs)
+                state.extend("detected_techs", cleaned)
 
         # Shodan InternetDB enrichment (2026-09-03): populate each
         # live_host with passive intel (ports/CVEs/tags/vulns/hostnames)
@@ -267,6 +268,108 @@ Rules:
             state.log(self.NAME, "shodan",
                        f"InternetDB enriched {enriched} live_host(s) with "
                        f"passive intel (ports/CVEs/tags)")
+
+
+# ── N6+N7 (2026-09-03): tech name normalization + version sanity ──
+# Fixes seen in run 20260903T133821Z:
+#   - `WordPress:7.1` (WP core has no 7.x; likely bad detection)
+#   - Duplicates: 'wordpress' vs 'wordpress:7.1', 'wp rocket' vs 'wp-rocket'
+_TECH_VERSION_RANGES: dict[str, tuple[str, str]] = {
+    # Format: {canonical_slug: (min_plausible, max_plausible)}
+    "wordpress": ("3.0", "6.99"),
+    "drupal": ("6.0", "12.99"),
+    "joomla": ("2.0", "6.99"),
+    "magento": ("1.0", "3.99"),
+    "php": ("5.0", "8.99"),
+    "python": ("2.0", "3.99"),
+    "nodejs": ("10.0", "24.99"),
+    "jquery": ("1.0", "4.99"),
+    "jquery migrate": ("1.0", "4.99"),
+    "django": ("1.0", "6.99"),
+    "rails": ("3.0", "8.99"),
+    "laravel": ("4.0", "12.99"),
+    "spring": ("3.0", "7.99"),
+    "nginx": ("0.7", "1.99"),
+    "apache": ("1.3", "3.99"),
+    "iis": ("6.0", "12.99"),
+    "tomcat": ("5.0", "12.99"),
+}
+
+
+def _parse_version_tuple(v: str) -> tuple:
+    """Best-effort split of 'X.Y.Z' → (X, Y, Z). Non-numeric → 0."""
+    parts = []
+    for p in str(v).split(".")[:4]:
+        try:
+            parts.append(int("".join(c for c in p if c.isdigit()) or "0"))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _version_in_range(v: str, lo: str, hi: str) -> bool:
+    return _parse_version_tuple(lo) <= _parse_version_tuple(v) <= \
+           _parse_version_tuple(hi)
+
+
+def _canonical_slug(name: str) -> str:
+    """Normalize a tech NAME (no version): lowercase, spaces→dashes,
+    strip leading/trailing punctuation. `WP Rocket` and `wp-rocket` both
+    become `wp-rocket`."""
+    s = str(name).lower().strip()
+    s = " ".join(s.split())           # collapse whitespace
+    s = s.replace(" ", "-").strip("-._")
+    return s
+
+
+def _split_name_version(t: str) -> tuple[str, str | None]:
+    """Split 'wordpress:7.1' → ('wordpress', '7.1'); 'nginx' → ('nginx', None).
+    Version part is stripped of :confidence trailing junk."""
+    t = str(t).strip()
+    if ":" not in t:
+        return _canonical_slug(t), None
+    name, _, ver = t.partition(":")
+    ver = ver.strip()
+    # Some detectors append :<confidence> or :<hash>. Keep only the
+    # x.y or x.y.z prefix (a version-like token).
+    import re as _re
+    m = _re.match(r"^(\d+(?:\.\d+){0,3})", ver)
+    ver = m.group(1) if m else None
+    return _canonical_slug(name), ver
+
+
+def _normalize_and_dedup_techs(techs) -> list[str]:
+    """N6+N7 fix: collapse duplicates + sanity-check version ranges.
+
+    Two techs pointing to the same product (e.g. `wp rocket` and
+    `wp-rocket`, or `wordpress` and `wordpress:7.1`) merge into ONE
+    entry — the version-ful one wins if the version is in a plausible
+    range; otherwise the bare name is kept (and a warning could be added
+    later). Names with implausible versions (e.g. `wordpress:7.1` when
+    WP is on the 6.x series) drop the version part.
+    """
+    canonical: dict[str, str | None] = {}
+    for raw in techs:
+        slug, ver = _split_name_version(raw)
+        if not slug:
+            continue
+        if ver and slug in _TECH_VERSION_RANGES:
+            lo, hi = _TECH_VERSION_RANGES[slug]
+            if not _version_in_range(ver, lo, hi):
+                # Drop the version — implausible for this product
+                ver = None
+        if slug not in canonical:
+            canonical[slug] = ver
+        elif ver and not canonical[slug]:
+            # Upgrade: had `foo` without version, now we have `foo:X.Y`
+            canonical[slug] = ver
+    out = []
+    for slug in sorted(canonical.keys()):
+        v = canonical[slug]
+        out.append(f"{slug}:{v}" if v else slug)
+    return out
 
 
 def _append_httpx_record(live: list, rec: dict) -> None:

@@ -235,6 +235,42 @@ class ReportAgent(BaseAgent):
                 lines.append(f"- … and {len(subs) - 100} more")
             lines.append("")
 
+        # N12 fix (2026-09-03): Shodan InternetDB Enrichment section.
+        # Before this, the log line `[shodan] InternetDB enriched N host(s)`
+        # was the only visible artifact. Now each host's ports/CVEs/tags
+        # get a dedicated block in the report — critical intel for the
+        # operator (CVE ids from Shodan match to nuclei/wpscan work).
+        shodan_hosts = [h for h in (s.get("live_hosts") or [])
+                        if h.get("shodan") and not
+                        h["shodan"].get("not_indexed")]
+        if shodan_hosts:
+            lines.append(f"## Shodan InternetDB Enrichment "
+                         f"({len(shodan_hosts)} host(s))")
+            for h in shodan_hosts:
+                sh = h["shodan"]
+                host = h.get("host", "?")
+                ip = sh.get("ip", "?")
+                lines.append(f"- **`{host}` (IP: `{ip}`)**")
+                ports = sh.get("ports") or []
+                if ports:
+                    lines.append(f"  - Open ports: {', '.join(str(p) for p in ports)}")
+                vulns = sh.get("vulns") or []
+                if vulns:
+                    lines.append(f"  - Known CVEs (Shodan DB): "
+                                 f"{', '.join(str(v) for v in vulns[:10])}"
+                                 f"{'…' if len(vulns) > 10 else ''}")
+                tags = sh.get("tags") or []
+                if tags:
+                    lines.append(f"  - Tags: {', '.join(tags[:8])}")
+                cpes = sh.get("cpes") or []
+                if cpes:
+                    lines.append(f"  - CPEs: `{cpes[0]}`"
+                                 f"{f' +{len(cpes)-1} more' if len(cpes) > 1 else ''}")
+                hostnames = sh.get("hostnames") or []
+                if hostnames and hostnames != [host]:
+                    lines.append(f"  - Other hostnames: {', '.join(hostnames[:5])}")
+            lines.append("")
+
         # Live hosts detail
         live = s.get("live_hosts", [])
         if live:
@@ -421,6 +457,36 @@ class ReportAgent(BaseAgent):
                     "`gem install wpscan` (macOS: `brew install ruby && "
                     "gem install wpscan`) and re-run for meaningful WP "
                     "coverage.")
+            # (g) WPScan API daily quota exhausted (25/day free tier).
+            # The wordpress agent detected the quota marker in a wpscan
+            # output and un-exported the env var for the rest of the
+            # session. Report tells the operator so they know why any
+            # subsequent WP scan today skips the CVE-DB lookup.
+            if s.get("wpscan_api_exhausted"):
+                _meta_warnings.append(
+                    "**WPScan API daily quota reached** (25 req/day free "
+                    "tier). Subsequent wpscan calls this session run "
+                    "WITHOUT `--api-token` — plugin/theme/user enumeration "
+                    "still works but there is NO CVE-DB cross-match. Quota "
+                    "resets at midnight UTC, or upgrade the plan at "
+                    "<https://wpscan.com/pricing>. To reduce quota use per "
+                    "run, drop repeated wpscan calls (see anti-repeat "
+                    "guardrail in base.py — one wpscan --enumerate per host "
+                    "should suffice).")
+            # (h) Shodan Pro credits exhausted (paid plan monthly limit).
+            # ToolRegistry marks state.shodan_pro_exhausted=True on 402 or
+            # any 'credits' marker; subsequent shodan_search calls this
+            # session short-circuit. The LLM sees the ERROR and falls back
+            # to shodan_internetdb (still free).
+            if s.get("shodan_pro_exhausted"):
+                _meta_warnings.append(
+                    "**Shodan Pro credits exhausted** (monthly query "
+                    "quota reached). Subsequent `shodan_search` calls "
+                    "this session short-circuit to ERROR — the LLM is "
+                    "directed to fall back to `shodan_internetdb` "
+                    "(free, no quota, always available). Top up at "
+                    "<https://account.shodan.io> or wait for the monthly "
+                    "reset.")
         except Exception:
             pass  # meta-check NEVER breaks the report
 

@@ -31,10 +31,18 @@ so the harness parses the JSONL file deterministically (stdout of nuclei
 sometimes gets buffered/truncated by the tool wrapper — file always wins).
 Append (`>>`) NOT truncate if you run nuclei multiple times.
 
+PERFORMANCE (N4 fix — 2026-09-03): use `-c 25 -rl 20 -timeout 5` on ALL
+scans below. `-c 5 -rl 5` (old defaults) burned 900s+ per scan against
+Cloudflare-fronted targets; the new values are safe on Cloudflare (it
+throttles at ~50 req/s and nuclei auto-backs-off on 429). NEVER run
+`-tags cve` without narrowing — the raw tag has 6k+ templates and always
+times out. ALWAYS narrow via `-tags cve,<tech>` where <tech> is one of
+the actual detected_techs (max 3 combined).
+
   1. Generic exposures (always, first):
        nuclei -u <host> -tags exposures,exposed-panels,misconfig \
-         -severity info,low,medium,high,critical -rl 5 -c 5 -silent \
-         -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
+         -severity info,low,medium,high,critical -c 25 -rl 20 -timeout 5 \
+         -silent -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
      Reason: catches .git / .env / config files / debug pages / open dashboards.
 
   2. Security headers:
@@ -44,12 +52,19 @@ Append (`>>`) NOT truncate if you run nuclei multiple times.
   3. Default credentials scan (LAB ONLY — DVWA/Juice Shop/Mutillidae/BWA/
      self-hosted lab). Skip against real bug-bounty targets:
        nuclei -u <host> -tags default-login -severity medium,high,critical \
-         -rl 5 -c 5 -silent -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
+         -c 25 -rl 20 -timeout 5 -silent \
+         -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
 
-  4. Per-tech CVE scan — one call per tech in detected_techs (max 5 techs).
-     If a tech has known nuclei templates:
-       nuclei -u <host> -tags <tech-lowercase> -severity medium,high,critical \
-         -rl 5 -c 5 -silent -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
+  4. Per-tech CVE scan — one call per tech in detected_techs (max 3 techs).
+     Combine tech tag WITH `cve` to narrow the 6k+ generic CVE templates:
+       nuclei -u <host> -tags cve,<tech-lowercase> -severity medium,high,critical \
+         -c 25 -rl 20 -timeout 5 -silent \
+         -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
+     Common product tags: wordpress, joomla, drupal, magento, phpmyadmin,
+     grafana, jenkins, gitlab, jira, confluence, tomcat, spring, laravel,
+     nextjs, keycloak, minio, elasticsearch, kibana, airflow, dokploy,
+     coolify, portainer, n8n.
+     NEVER: `-tags cve` alone (times out). ALWAYS combine with a product tag.
      Common product tags nuclei supports:
        wordpress, joomla, drupal, magento, adminer, phpmyadmin, grafana,
        jenkins, gitlab, jira, confluence, nginx, apache, iis, tomcat,
@@ -149,9 +164,20 @@ Rules:
         # wrapper (bug B3 was hiding stdout output as "(no exit)" — B5
         # bypasses that channel entirely for nuclei findings).
         try:
-            _parse_nuclei_jsonl_to_findings(
+            added = _parse_nuclei_jsonl_to_findings(
                 state, self.NAME,
                 glob_pattern="harness-nuclei-webvuln*.jsonl")
+            # N9 metric — log the RAW volume even when added=0 so the
+            # operator can tell "nuclei found 40 things but the parser
+            # discarded them all" vs "nuclei found nothing".
+            counts = _count_nuclei_jsonl_lines("harness-nuclei-webvuln*.jsonl")
+            if counts["total_lines"] or added:
+                state.log(self.NAME, "metrics",
+                           f"nuclei JSONL: total_lines={counts['total_lines']} "
+                           f"json_records={counts['total_matches']} "
+                           f"→ findings_added={added} "
+                           f"(diff={counts['total_matches']-added} filtered as "
+                           f"info/-detect/-panel or duplicate)")
         except Exception as e:
             state.log(self.NAME, "warn",
                       f"nuclei JSONL parse failed: {type(e).__name__}: {e}")
@@ -350,11 +376,46 @@ def _parse_nuclei_jsonl_to_findings(state, agent_name: str,
                 added += 1
         except Exception:
             continue
-    if added:
-        state.log(agent_name, "info",
-                   f"parsed {added} finding(s) from nuclei JSONL "
-                   f"file(s) matching {glob_pattern}")
+    # N9 metrics — always log the tally, even 0 findings, so the operator
+    # can debug "why 0 findings after 54 min?" via the report.
+    state.log(agent_name, "info",
+               f"nuclei JSONL ingested: added {added} finding(s) "
+               f"from file(s) matching {glob_pattern}")
     return added
+
+
+def _count_nuclei_jsonl_lines(glob_pattern: str) -> dict:
+    """Diagnostic counter: how many raw lines exist in the JSONL sinks vs
+    how many were emitted as findings. Used by web_vuln.after_run to log
+    a transparency breakdown (N9 fix).
+
+    Returns {'total_lines': N, 'total_matches': N, 'files': [paths]}.
+    """
+    from pathlib import Path as _P
+    tmp = _P("/tmp")
+    total_lines = 0
+    total_matches = 0
+    files = []
+    if not tmp.is_dir():
+        return {"total_lines": 0, "total_matches": 0, "files": []}
+    for f in sorted(tmp.glob(glob_pattern)):
+        try:
+            if not f.is_file():
+                continue
+            files.append(str(f))
+            for line in f.read_text(encoding="utf-8",
+                                     errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                total_lines += 1
+                if line.startswith("{"):
+                    total_matches += 1
+        except Exception:
+            continue
+    return {"total_lines": total_lines,
+            "total_matches": total_matches,
+            "files": files}
 
 
 def _primary_url(state):

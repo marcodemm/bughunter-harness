@@ -108,24 +108,58 @@ def _parse_severity_prefix(text: str) -> tuple[str, str]:
 def _headers_reminder(custom_headers: dict[str, str]) -> str:
     """Build the system-prompt fragment that tells the model to attach the
     configured custom headers to every HTTP-based shell command it runs.
-    Empty when no custom_headers are configured — no extra tokens wasted."""
+    Empty when no custom_headers are configured — no extra tokens wasted.
+
+    2026-09-03: expanded examples to cover wpscan/sqlmap/dalfox/gobuster/
+    dirsearch/feroxbuster and each tool's specific flag syntax (some use
+    `--headers` instead of `-H`, some accept `-H` multiple times, wpscan
+    concatenates with `; `). The old reminder only mentioned curl/nuclei/
+    ffuf and the model would forget the header for other tools — regression
+    seen in run 20260903T133821Z where wordpress agent ran wpscan WITHOUT
+    the required X-Grayback attribution header for the whole session.
+    """
     if not custom_headers:
         return ""
-    lines = ["\n\nCUSTOM HTTP HEADERS (attribution — MANDATORY)",
-             "The operator has configured attribution headers that MUST reach the",
-             "target on every HTTP request. The harness injects them automatically",
-             "on http_get / http_post — you do NOT need to add them there.",
+    lines = ["",
+             "═══════════════════════════════════════════════════════════════",
+             "CUSTOM HTTP HEADERS (attribution — MANDATORY, EVERY TOOL CALL)",
+             "═══════════════════════════════════════════════════════════════",
+             "The operator has configured attribution headers that MUST reach",
+             "the target on EVERY HTTP request. The harness injects them",
+             "automatically on http_get / http_post — you do NOT need to add",
+             "them there.",
              "",
-             "For every run_shell command that hits HTTP (curl, nuclei, ffuf, httpx,",
-             "katana, nikto, wpscan, feroxbuster), you MUST include these -H flags:"]
+             "For every run_shell command that hits HTTP, you MUST include the",
+             "header via the tool's specific flag syntax. Header value(s):"]
     for name, value in custom_headers.items():
-        lines.append(f'  -H "{name}: {value}"')
+        lines.append(f'    {name}: {value}')
     lines.append("")
-    lines.append("Examples:")
-    hdrs = " ".join(f'-H "{n}: {v}"' for n, v in custom_headers.items())
-    lines.append(f'  curl -sI {hdrs} https://target.com/')
-    lines.append(f'  nuclei -u https://target.com {hdrs} -tags cve -silent')
-    lines.append(f'  ffuf -u https://target.com/FUZZ {hdrs} -w wl.txt')
+    lines.append("Per-tool syntax cheat-sheet — copy the flag EXACTLY:")
+    dash_h = " ".join(f'-H "{n}: {v}"' for n, v in custom_headers.items())
+    # wpscan concatenates multiple headers with `; ` under a single --headers flag
+    wpscan_headers = "; ".join(f"{n}: {v}" for n, v in custom_headers.items())
+    lines.extend([
+        f'  curl:         {dash_h}',
+        f'  nuclei:       {dash_h}',
+        f'  httpx:        {dash_h}',
+        f'  ffuf:         {dash_h}',
+        f'  katana:       -H "..." (same as curl)',
+        f'  nikto:        {dash_h}',
+        f'  feroxbuster:  {dash_h}',
+        f'  gobuster:     {dash_h}',
+        f'  sqlmap:       --headers="{wpscan_headers}"',
+        f'  dalfox:       {dash_h}',
+        f'  wpscan:       --headers "{wpscan_headers}"',
+    ])
+    lines.append("")
+    lines.append("Concrete examples:")
+    lines.append(f'  curl -sI {dash_h} https://target.com/')
+    lines.append(f'  nuclei -u https://target.com {dash_h} -tags cve -silent')
+    lines.append(f'  wpscan --url https://target.com --headers "{wpscan_headers}" '
+                 f'--random-user-agent --no-banner')
+    lines.append("")
+    lines.append("If you skip these headers the target's security team may")
+    lines.append("mark your traffic as unauthorized. NEVER omit them.")
     return "\n".join(lines)
 
 
@@ -148,6 +182,24 @@ wrote (`-o /tmp/…`, `> /tmp/…`) and read that file with `cat` / `head`,
 or (b) call finish() and let after_run() parse what's on disk. Re-running
 identical commands wastes turns and pollutes logs — it is a bug in the
 agent, not a fix.
+
+DENYLIST SUBSTITUTES (N2 fix — 2026-09-03):
+The shell wrapper rejects some tokens for safety. If a tool_call returns
+`ERROR: forbidden token 'X'`, DO NOT retry the same command hoping it
+works — the rejection is deterministic. Use these substitutes on your
+NEXT call:
+    &&           →   ;                 (sequential — same behaviour ~99% of the time)
+    ||           →   ; if [ $? -ne 0 ]; then <next-cmd>; fi
+    &  (bg)      →   Split into two consecutive shell calls, don't background
+    $(cmd)       →   Save cmd output to a temp file with `> /tmp/xxx.txt`
+                     then read it in the next call with `cat /tmp/xxx.txt`
+    `cmd`        →   Same as $(cmd) above
+    -sU/-sS/etc  →   These nmap flags are blocked. Use `-sV -sT` or
+                     `-Pn -sV` for TCP-only version scan.
+    -T4 / -T5    →   Blocked (too noisy). Use `-T3` (default) or omit.
+    sudo / rm    →   Never needed for recon — remove and retry.
+When you see the ERROR reply, apply the substitute on the SAME logical
+command and continue — do NOT re-issue the rejected form.
 """
 
 
@@ -529,26 +581,33 @@ class BaseAgent:
             raw_cmd = str(args.get("command", ""))
             cmd = raw_cmd[:200] + ("…" if len(raw_cmd) > 200 else "")
             # B3 fix (2026-09-03): buscar exit=<N> en TODO el output con
-            # regex, no solo primeras 3 lineas via startswith. tools.py
-            # antepone `[WARN] host ... exit=0` cuando scope_enforcement
-            # es "warn" -> startswith('exit=') fallaba -> "(no exit)"
-            # fantasma en el 90% de tool calls del run 20260903T094840Z.
-            # Ademas, cuando tools.py rechaza el comando (ERROR: forbidden
-            # token, ERROR: command timed out, ERROR: host not in scope
-            # strict) NO hay ningun `exit=` y antes la razon se perdia -
-            # ahora la primera linea "ERROR: ..." se surface en el log
-            # para que operador (y el LLM siguiente) vea POR QUE.
+            # regex. Además: reclassify SIGPIPE benignos (N11):
+            #   exit=141 (128+SIGPIPE) → cat/head/tail piped
+            #   exit=56  (curl "failure with receiving network data") →
+            #     ocurre cuando el pipe stage siguiente (head/tail) cierra
+            #     antes de que curl termine — NO es un fallo funcional.
+            #   Ambos se muestran como "exit=N (SIGPIPE, benign)" para no
+            #   despistar al operador.
             import re as _re_exit
             m = _re_exit.search(r"exit=(-?\d+)", result)
             if m:
-                status_note = f"exit={m.group(1)}"
+                code = int(m.group(1))
+                sig_note = ""
+                cmd_low = raw_cmd.lower()
+                pipe_ends_head_tail = any(
+                    t in cmd_low for t in ("| head", "|head", "| tail",
+                                            "|tail", "| less"))
+                if code == 141 and pipe_ends_head_tail:
+                    sig_note = " (SIGPIPE via head/tail — benign)"
+                elif code == 56 and "curl" in cmd_low and pipe_ends_head_tail:
+                    sig_note = " (curl+SIGPIPE from head/tail — benign)"
+                status_note = f"exit={code}{sig_note}"
             elif result.startswith("ERROR:"):
-                # Surface the rejection reason (denylist / timeout / scope)
                 status_note = result.splitlines()[0][:120]
             else:
                 status_note = ""
             state.log(self.NAME, "shell",
-                      f"{cmd} → {status_note[:120] or '(no exit)'}")
+                      f"{cmd} → {status_note[:150] or '(no exit)'}")
         elif tool == "oob_generate_token":
             state.log(self.NAME, "oob",
                       f"generated token for {args.get('vector', '?')}"

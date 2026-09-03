@@ -33,8 +33,10 @@ SHELL_HELPERS = {
     "base64", "jq", "yq",
 }
 
-# Hard-forbidden substrings anywhere in the full command line. These win over
-# the pipeline allowlist and abort execution.
+# Hard-forbidden PLAIN SUBSTRINGS anywhere in the full command line. These
+# win over the pipeline allowlist and abort execution. Case-insensitive.
+# Use this list ONLY for tokens that are safe to match as raw substrings
+# (they can't appear inside legitimate paths / other flags).
 SHELL_HARD_DENY = [
     # Auth-elevation / destructive filesystem
     "sudo", " su ", " rm ", " rm\t", "rm -", "mv -", "mkfs", "dd if=",
@@ -44,10 +46,23 @@ SHELL_HARD_DENY = [
     # Backgrounding / job control
     " & ", " &\n", "& ", "&\n", "nohup", "disown",
     # nmap noisy/aggressive
-    "-T4", "-T5", "-sS", "-sU", "-sN", "-sF", "-sX", "--script=vuln",
+    "-T4", "-T5", "--script=vuln",
     "--min-rate", "--max-rate",
     # HTTP destructive verbs
     "-X DELETE", "-X PUT", "-X PATCH",
+]
+
+# Hard-forbidden SHORT FLAG TOKENS that require WORD-BOUNDARY matching to
+# avoid false positives against legitimate paths / other flags.
+#
+# Bug seen in run 20260903T133821Z (2026-09-03): `subfinder -o
+# /tmp/harness-recon-subfinder.txt` was rejected because the path contains
+# `-subfinder` → substring `-sU` matches → recon returned 0 subs → cascade
+# to takeover skip. The fix is to require a non-word boundary around the
+# forbidden token so `-sU` only matches when it is a stand-alone flag, not
+# a substring inside another word.
+SHELL_HARD_DENY_FLAGS = [
+    "-sS", "-sU", "-sN", "-sF", "-sX",   # nmap scan-type flags
 ]
 
 # Chars that split the command into pipeline stages — allowed, each stage
@@ -176,6 +191,11 @@ class ToolRegistry:
         self.shodan_pro_calls_made = 0
         self.shodan_internetdb_enabled = bool(
             shodan_cfg.get("internetdb_enabled", True))
+        # 2026-09-03: session-sticky exhaustion flag — set to True when
+        # the Shodan API returns 402 (no credits) or an error mentioning
+        # quota. Future _shodan_search calls short-circuit to ERROR:
+        # exhausted without spending another attempt.
+        self.shodan_pro_exhausted = False
 
         # Extension tools — discovered by extension_loader.discover_tools()
         # at ToolRegistry construction. Adds binaries to SHELL_ALLOWLIST and
@@ -466,6 +486,17 @@ class ToolRegistry:
             if bad.lower() in lower_cmd:
                 return (f"ERROR: forbidden token '{bad.strip()}' in command "
                         "(hard denylist — no bypass)")
+        # Word-boundary flag denylist (2026-09-03): protects against false
+        # positives when a forbidden flag substring appears inside a legit
+        # path or a longer flag. Uses lookaround so `-sU` matches only when
+        # bounded by whitespace/end, NOT inside `-subfinder`.
+        import re as _re_deny
+        for flag in SHELL_HARD_DENY_FLAGS:
+            escaped = _re_deny.escape(flag)
+            pattern = rf"(?<![\w\-]){escaped}(?![\w\-])"
+            if _re_deny.search(pattern, command, _re_deny.IGNORECASE):
+                return (f"ERROR: forbidden flag '{flag}' in command "
+                        "(hard denylist — no bypass)")
 
         # Split into pipeline stages and validate the first token of each.
         stages = _split_pipeline_stages(command)
@@ -577,10 +608,16 @@ class ToolRegistry:
         return f"InternetDB {ip}:\n{r.text[:4096]}"
 
     def _shodan_search(self, query: str, limit=5) -> str:
-        """Query Shodan Pro search API — quota-protected.
+        """Query Shodan Pro search API — quota-protected + exhaustion-sticky.
 
         Enforces max_pro_calls_per_run so the LLM can't blast the paid
         quota. Requires shodan.api_key (or env $SHODAN_API_KEY).
+
+        2026-09-03: adds session-sticky exhaustion detection. When the API
+        returns 402 (no credits) or an error mentioning quota, subsequent
+        calls this session short-circuit to ERROR without spending another
+        attempt — the LLM sees the situation clearly and falls back to
+        InternetDB (free).
         """
         if not query or not str(query).strip():
             return "ERROR: empty Shodan query"
@@ -589,6 +626,11 @@ class ToolRegistry:
                     "shodan.api_key in config.yaml (or export "
                     "$SHODAN_API_KEY) to enable Pro search. Meanwhile "
                     "shodan_internetdb (free) is still available.")
+        if self.shodan_pro_exhausted:
+            return ("ERROR: Shodan Pro credits exhausted (detected on an "
+                    "earlier call this session — quota locked until it "
+                    "resets or you top up at https://account.shodan.io). "
+                    "Use shodan_internetdb (free, no quota) as fallback.")
         if self.shodan_pro_calls_made >= self.shodan_max_pro_calls:
             return (f"ERROR: Shodan Pro throttle exhausted for this run "
                     f"({self.shodan_pro_calls_made}/"
@@ -612,11 +654,55 @@ class ToolRegistry:
         if r.status_code == 401:
             return ("ERROR: Shodan API 401 — key rejected. "
                     "Verify config.shodan.api_key.")
+        if r.status_code == 402:
+            # No credits — mark exhausted for the rest of the session
+            self.shodan_pro_exhausted = True
+            if self.state:
+                try:
+                    self.state.set("shodan_pro_exhausted", True)
+                except Exception:
+                    pass
+            return ("ERROR: Shodan API 402 — Pro credits exhausted "
+                    "(monthly query quota reached). Subsequent Pro calls "
+                    "this session are short-circuited. Use "
+                    "shodan_internetdb (free) or top up at "
+                    "https://account.shodan.io.")
         if r.status_code == 429:
             return ("ERROR: Shodan API 429 — rate-limited by the "
                     "provider itself (not our throttle).")
         if r.status_code != 200:
+            # Some Shodan errors return 200 or 400 with JSON body mentioning
+            # quota. Detect the quota marker in the response body too.
+            body_low = r.text[:400].lower()
+            if any(m in body_low for m in
+                   ("no query credits", "query credits available",
+                    "insufficient credits", "credits available",
+                    "monthly query limit", "quota exceeded")):
+                self.shodan_pro_exhausted = True
+                if self.state:
+                    try:
+                        self.state.set("shodan_pro_exhausted", True)
+                    except Exception:
+                        pass
+                return ("ERROR: Shodan API reports credits exhausted "
+                        f"(HTTP {r.status_code}). Session-locked. "
+                        "Fallback to shodan_internetdb.")
             return f"ERROR: Shodan API HTTP {r.status_code}: {r.text[:400]}"
+        # HTTP 200 — even on 200 the response body can carry an error field
+        # in some deprecated endpoints. Check for quota marker in body:
+        body_low = r.text[:400].lower()
+        if any(m in body_low for m in
+               ("no query credits", "query credits available",
+                "insufficient credits", "monthly query limit")):
+            self.shodan_pro_exhausted = True
+            if self.state:
+                try:
+                    self.state.set("shodan_pro_exhausted", True)
+                except Exception:
+                    pass
+            return ("ERROR: Shodan API returned quota-exhausted marker "
+                    "in 200 body. Session-locked. Fallback to "
+                    "shodan_internetdb.")
         try:
             data = r.json()
             matches = data.get("matches", []) or []
