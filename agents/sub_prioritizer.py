@@ -495,8 +495,44 @@ def _score_shodan(host_record: dict) -> tuple[int, list[str]]:
     return min(30, score), reasons
 
 
+# ── PN4 fix (2026-09-04): vendor-panel penalty + in-scope target bonus ─
+# Names of software vendor login panels (cPanel / WHM / Plesk / Roundcube
+# / Horde / phpMyAdmin etc.) — third-party code, audited by thousands of
+# other bug-hunters, extremely low probability of a novel bug per host.
+# Whenever the sub label is one of these AND the label is the leftmost
+# subdomain component, penalize the name score.
+_VENDOR_PANEL_LABELS = {
+    "cpanel", "whm", "plesk", "phpmyadmin", "roundcube", "horde",
+    "squirrelmail", "cpcalendars", "cpcontacts", "webdisk", "webmail",
+    "autoconfig", "autodiscover", "directadmin", "ispconfig", "hestiacp",
+    "vestacp", "cyberpanel", "cloudpanel", "aapanel",
+}
+
+
+def _in_scope_bonus(hostname: str, in_scope_hosts: set[str]) -> tuple[int, list[str]]:
+    """Return +50 if the sub is in the operator's explicit in_scope
+    allowlist. Guarantees the operator's target beats any admin-sub
+    that a name-heuristic promoted."""
+    if not in_scope_hosts:
+        return 0, []
+    h = hostname.split(":", 1)[0].lower().rstrip(".")
+    if h in in_scope_hosts:
+        return 50, [f"in-scope target (hostname exact match) (+50)"]
+    return 0, []
+
+
+def _vendor_penalty(hostname: str) -> tuple[int, list[str]]:
+    """Return a negative delta when the leftmost sub label is a
+    well-known vendor panel — those hosts are almost never the source
+    of the bug you're hunting."""
+    label = hostname.split(":", 1)[0].lower().split(".")[0]
+    if label in _VENDOR_PANEL_LABELS:
+        return -25, [f"vendor panel label {label!r} — low bug probability (-25)"]
+    return 0, []
+
+
 # ── Combine ─────────────────────────────────────────────────────────
-def score_host(host_record: dict) -> dict:
+def score_host(host_record: dict, in_scope_hosts: set[str] | None = None) -> dict:
     hostname = str(host_record.get("host", ""))
     status = host_record.get("status")
     techs = host_record.get("tech") or host_record.get("technologies") or []
@@ -512,9 +548,11 @@ def score_host(host_record: dict) -> dict:
     po_s, po_r = _score_ports(ports)
     pen_s, pen_r = _penalty_random(hostname)
     sh_s, sh_r = _score_shodan(host_record)
+    vp_s, vp_r = _vendor_penalty(hostname)
+    sc_s, sc_r = _in_scope_bonus(hostname, in_scope_hosts or set())
 
-    total = n_s + st_s + te_s + ti_s + po_s + pen_s + sh_s
-    reasons = n_r + st_r + te_r + ti_r + po_r + pen_r + sh_r
+    total = n_s + st_s + te_s + ti_s + po_s + pen_s + sh_s + vp_s + sc_s
+    reasons = n_r + st_r + te_r + ti_r + po_r + pen_r + sh_r + vp_r + sc_r
 
     # Hard cap: parking pages / for-sale / expired titles → LOW tier no matter
     # what a juicy-looking name suggests. This handles `test.example.com` with
@@ -546,7 +584,7 @@ def score_host(host_record: dict) -> dict:
         "components": {
             "name": n_s, "status": st_s, "tech": te_s,
             "title": ti_s, "ports": po_s, "penalty": pen_s,
-            "shodan": sh_s,
+            "shodan": sh_s, "vendor": vp_s, "in_scope": sc_s,
             "cf_challenge": -30 if cf_challenge else 0,
         },
         "reasons": reasons,
@@ -580,21 +618,53 @@ class SubPrioritizerAgent(BaseAgent):
         self._emit("start", description=self.DESCRIPTION, max_iterations=1)
         try:
             live = state.get("live_hosts") or []
-            scored = [score_host(h) for h in live]
+            # PN4 fix (2026-09-04): pass in-scope info into scoring so
+            # in-scope targets get a +50 bonus, guaranteeing they beat
+            # any vendor-panel sub by name score.
+            in_scope = set(str(h).lower().split(":", 1)[0]
+                            for h in (state.get("in_scope_hosts") or []))
+            scored = [score_host(h, in_scope_hosts=in_scope) for h in live]
             scored.sort(key=lambda x: x["score"], reverse=True)
 
-            # Re-merge with original records so downstream sees priority_*
-            # fields but everything else (status/title/tech) is preserved.
-            new_live: list[dict] = []
-            for s in scored:
-                orig = next((h for h in live
-                             if str(h.get("host", "")) == s["host"]),
-                            {"host": s["host"]})
-                merged = dict(orig)
-                merged["priority_score"] = s["score"]
-                merged["priority_tier"] = s["tier"]
-                new_live.append(merged)
-            state.set("live_hosts", new_live)
+            # PN3-A fix (2026-09-04): DO NOT reorder state.live_hosts.
+            # Before: state.set("live_hosts", new_live) put the top-ranked
+            # sub (e.g. cpanel score=56) at [0], and every downstream
+            # agent that read live_hosts[0] (web_vuln._primary_url,
+            # content_discovery, fingerprint._first_live_url) scanned the
+            # wrong host. Root cause of PN2 + PN3 + N10 waste. Now:
+            #   - `prioritized_hosts` is the side channel with the ranking
+            #     (multi-host loop already consumes this, not live_hosts).
+            #   - `live_hosts` order is ONLY massaged so that the ORIGINAL
+            #     target (state.target's hostname) sits at [0] as an
+            #     invariant — anything else keeps its original recon order.
+            #   - Each host record still gets `priority_score` + tier
+            #     annotated in-place so the report table renders correctly.
+            score_by_host = {s["host"]: s for s in scored}
+            for h in live:
+                s = score_by_host.get(str(h.get("host", "")))
+                if s:
+                    h["priority_score"] = s["score"]
+                    h["priority_tier"] = s["tier"]
+
+            from urllib.parse import urlparse as _up
+            orig_hostname = ""
+            try:
+                orig_hostname = (_up(state.get("target") or "").hostname
+                                  or "").lower()
+            except Exception:
+                orig_hostname = ""
+            reordered = list(live)
+            if orig_hostname:
+                # Move the original target to the front if it's present.
+                # Everything else keeps its recon order — no re-sort by score.
+                idx = next(
+                    (i for i, h in enumerate(reordered)
+                     if str(h.get("host", "")).lower().split(":", 1)[0]
+                     == orig_hostname),
+                    -1)
+                if idx > 0:
+                    reordered.insert(0, reordered.pop(idx))
+            state.set("live_hosts", reordered)
             state.set("prioritized_hosts", scored)
 
             # Narrative summary for REPORT

@@ -712,16 +712,30 @@ Rules:
                               if d["tech"] and len(d["tech"]) < 40}))
 
         # Emit one info finding per (tech, version)
+        # PN2 fix (2026-09-04): extract the URL from the evidence itself
+        # (nuclei matched-at, curl URL, meta URL) instead of always using
+        # primary_url. Before this, if sub_prioritizer put a DIFFERENT
+        # host at live_hosts[0] than the one where nuclei actually matched
+        # the tech, findings would attribute the detection to the wrong
+        # host — cpanel appeared as "WordPress with 6 plugins" when the
+        # real matches were on www.
+        _url_in_ev_re = re.compile(r"https?://[^\s\[\]()<>\"']+", re.IGNORECASE)
         for d in deduped:
             tech = d["tech"]
             version = d["version"]
             source = d["source"]
             ev = d["evidence"]
+            # Prefer the URL that appears in the evidence itself; fall
+            # back to primary_url only when the evidence carries no URL
+            # (rare — the finish() summary path).
+            m_url = _url_in_ev_re.search(str(ev))
+            attributed_url = m_url.group(0).rstrip(".,;:'\"") if m_url \
+                             else primary_url
             title_ver = f" {version}" if version else ""
             suspect = _suspect_version(tech, version)
             suspect_tag = "  [SUSPECT VERSION]" if suspect else ""
-            title = f"{tech}{title_ver} detected on {primary_url}{suspect_tag}"
-            rec = _recommendation_for(tech, version, primary_url)
+            title = f"{tech}{title_ver} detected on {attributed_url}{suspect_tag}"
+            rec = _recommendation_for(tech, version, attributed_url)
             if suspect:
                 rec = f"{suspect}\n\n{rec}"
             state.add_finding(

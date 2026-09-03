@@ -138,6 +138,124 @@ def _split_pipeline_stages(cmd: str) -> list[str]:
     return [s for s in stages if s]
 
 
+# N10/PN1 fix (2026-09-04): plumbing-level auto-injection of custom
+# headers into HTTP-aware tool invocations. Each entry: tool binary
+# → (flag_syntax, join_char).
+#   dash-h: repeat `-H "N: V"` per header (curl-family)
+#   wpscan: single `--headers "N: V; N2: V2"` (semicolon join)
+#   sqlmap: single `--headers="N: V\nN2: V2"` (newline join)
+#   header: alias for hakrawler
+_HEADER_TOOLS: dict[str, str] = {
+    "curl": "dash-h",
+    "nuclei": "dash-h",
+    "httpx": "dash-h",
+    "ffuf": "dash-h",
+    "nikto": "dash-h",
+    "feroxbuster": "dash-h",
+    "dalfox": "dash-h",
+    "katana": "dash-h",
+    "hakrawler": "dash-h-lower",  # hakrawler uses -h not -H
+    "gobuster": "dash-h",
+    "wfuzz": "dash-h",
+    "wpscan": "wpscan",
+    "sqlmap": "sqlmap",
+}
+
+
+def _cmd_already_has_header(cmd: str, name: str) -> bool:
+    """True if the command line already carries the header `name` in any
+    of the supported flag forms."""
+    # curl-family: -H "X-Foo: bar"  or  -H 'X-Foo: bar'  or  -H X-Foo:...
+    # (case-insensitive check on the header name only)
+    lo = cmd.lower()
+    n_lo = name.lower()
+    for marker in (f"-h \"{n_lo}", f"-h '{n_lo}", f"-h {n_lo}",
+                   f"--header \"{n_lo}", f"--header '{n_lo}",
+                   f"--header={n_lo}", f"--headers \"{n_lo}",
+                   f"--headers '{n_lo}", f"--headers=\"{n_lo}",
+                   f"--headers='{n_lo}"):
+        if marker in lo:
+            return True
+    return False
+
+
+def _inject_headers_into_command(command: str,
+                                   headers: dict[str, str]) -> str:
+    """Walk each pipeline stage; if the first token is an HTTP-aware
+    tool AND the required headers are not already present in that
+    stage, append the flag(s) at the end of that stage.
+
+    Never modifies stages whose first token isn't in _HEADER_TOOLS
+    (grep/awk/cat/sort/etc stay untouched)."""
+    if not headers or not command.strip():
+        return command
+    stages = _split_pipeline_stages(command)
+    if not stages:
+        return command
+    # Preserve original separators between stages. Rebuild by scanning
+    # `command` for the same separators in order.
+    rebuilt: list[str] = []
+    remaining = command
+    for stage in stages:
+        # Find this stage in the remaining string (it starts wherever
+        # remaining currently starts, modulo leading whitespace).
+        idx = remaining.find(stage)
+        if idx < 0:
+            # Shouldn't happen; play safe and skip transformation
+            return command
+        prefix = remaining[:idx]
+        remaining = remaining[idx + len(stage):]
+        try:
+            toks = shlex.split(stage)
+        except ValueError:
+            rebuilt.append(prefix + stage)
+            continue
+        if not toks:
+            rebuilt.append(prefix + stage)
+            continue
+        first = toks[0].lower()
+        syntax = _HEADER_TOOLS.get(first)
+        if syntax is None:
+            rebuilt.append(prefix + stage)
+            continue
+        new_stage = _append_headers_to_stage(stage, headers, syntax)
+        rebuilt.append(prefix + new_stage)
+    rebuilt.append(remaining)  # trailing whitespace / anything after
+    return "".join(rebuilt)
+
+
+def _append_headers_to_stage(stage: str, headers: dict[str, str],
+                              syntax: str) -> str:
+    """Append missing header flags to a single pipeline stage."""
+    additions: list[str] = []
+    if syntax in ("dash-h", "dash-h-lower"):
+        flag = "-h" if syntax == "dash-h-lower" else "-H"
+        for name, value in headers.items():
+            if not _cmd_already_has_header(stage, name):
+                # Escape any embedded double quotes
+                v = str(value).replace('"', '\\"')
+                additions.append(f'{flag} "{name}: {v}"')
+    elif syntax == "wpscan":
+        # wpscan concatenates multiple headers with `; ` under one --headers
+        missing = [(n, v) for n, v in headers.items()
+                   if not _cmd_already_has_header(stage, n)]
+        if missing:
+            joined = "; ".join(f"{n}: {v}" for n, v in missing)
+            joined = joined.replace('"', '\\"')
+            additions.append(f'--headers "{joined}"')
+    elif syntax == "sqlmap":
+        # sqlmap wants headers joined with an actual newline inside quotes
+        missing = [(n, v) for n, v in headers.items()
+                   if not _cmd_already_has_header(stage, n)]
+        if missing:
+            joined = "\\n".join(f"{n}: {v}" for n, v in missing)
+            joined = joined.replace('"', '\\"')
+            additions.append(f'--headers="{joined}"')
+    if not additions:
+        return stage
+    return stage.rstrip() + " " + " ".join(additions)
+
+
 class ToolRegistry:
     def __init__(self, scope, limiter, cfg: dict):
         self.scope = scope
@@ -479,6 +597,21 @@ class ToolRegistry:
     def _shell(self, command: str) -> str:
         if not command or not command.strip():
             return "ERROR: empty command"
+
+        # N10/PN1 fix (2026-09-04): auto-inject custom_headers into
+        # HTTP-aware tool invocations BEFORE validation. The LLM has
+        # forgotten the -H flag on 20/20 tool calls across 4 iterations
+        # despite ALL-CAPS banners at the top of the prompt + one-liner
+        # reminders in every objective. This is a plumbing fix: the
+        # shell tool intercepts every stage's first token and, if it is
+        # `curl`/`nuclei`/`wpscan`/`httpx`/`ffuf`/`nikto`/`feroxbuster`/
+        # `sqlmap`/`dalfox`/`katana`/`hakrawler` and the header is NOT
+        # already present, adds the flag with the tool's specific syntax
+        # (curl-family → `-H`, wpscan → `--headers`, sqlmap → `--headers=`).
+        # Zero dependency on the LLM.
+        if self.custom_headers:
+            command = _inject_headers_into_command(command,
+                                                    self.custom_headers)
 
         # Hard denylist first — always wins.
         lower_cmd = " " + command.lower() + " "

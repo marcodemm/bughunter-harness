@@ -31,18 +31,27 @@ scored above the WP host but WordPress does not live there.
 Workflow (one tool_call per turn):
 
   0. PRE-CHECK — verify wpscan is installed:
-       command -v wpscan
-     If exit=1 (wpscan not found), SKIP steps 1-2 and go straight to step
-     3. Do NOT retry wpscan — it will keep failing. Log that wpscan is
-     missing so the operator installs it (`gem install wpscan`).
+       which wpscan            (POSIX-safe; `command -v` is blocked by allowlist)
+     If exit ≠ 0 (wpscan not found), SKIP steps 1-2 and go straight to
+     step 3. Do NOT retry wpscan — it will keep failing. Log that
+     wpscan is missing so the operator installs it (`gem install wpscan`).
 
-  1. wpscan --url <target> --random-user-agent --no-banner \
+  0b. IMPORTANT — Cloudflare/WAF bypass:
+     Use a REAL Chrome User-Agent (see the `--user-agent "…Chrome/128…"`
+     flag in every wpscan step below). NEVER use `--random-user-agent`
+     — it picks scanner-known UAs that Cloudflare / Sucuri / DataDome
+     block on sight. Symptom of a WAF block: wpscan exit=4 with
+     "does not seem to be running WordPress" while nuclei-wordpress-detect
+     already confirmed the target IS WordPress. Retry only makes it worse;
+     if steps 1-2 all return exit=4, jump straight to step 3 (nuclei).
+
+  1. wpscan --url <target> --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" --no-banner \
        --format json -o /tmp/harness-wpscan.json \
        --disable-tls-checks [--api-token "$WPSCAN_API_TOKEN"]
        (JSON output — parsed deterministically by the harness. Do NOT
         use --format cli; the parser needs JSON.)
   2. wpscan --url <target> --enumerate p,u,t --plugins-detection aggressive \
-       --random-user-agent --no-banner \
+       --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" --no-banner \
        --format json -o /tmp/harness-wpscan-full.json \
        --disable-tls-checks [--api-token "$WPSCAN_API_TOKEN"]
        (heavier; ok to skip if step 1 already listed plugins with versions)
