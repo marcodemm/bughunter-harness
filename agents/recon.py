@@ -98,7 +98,12 @@ Rules:
             # regardless of status_code. 401/403 are auth-protected =
             # interesting; 200 is public; keep both.
             if "httpx" in cmd and "-json" in cmd:
-                for m in re.finditer(r"-o\s+(\S+)", cmd):
+                # Capture any file the model wrote httpx output to, so the
+                # fallback can read it even when the model then filtered
+                # with `jq 'select(.status < 400)'` (which drops the
+                # juicy 401/403 hosts). Match both httpx `-o file` AND
+                # shell redirects `> file` / `>> file`.
+                for m in re.finditer(r"(?:-o|>>?)\s+(\S+)", cmd):
                     httpx_out_files.add(m.group(1))
                 for line in result.splitlines():
                     line = line.strip()

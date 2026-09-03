@@ -359,6 +359,13 @@ def _penalty_random(hostname: str) -> tuple[int, list[str]]:
 
 # ── Name score (max across matched tokens) ──────────────────────────
 def _score_name(hostname: str) -> tuple[int, list[str]]:
+    """Return the max score across all matched tokens.
+
+    IMPORTANT: this is the MAX not the SUM, and NEGATIVE values are
+    respected — a sub `clerk.example.com` with only `clerk: -10` in the
+    table returns -10 (initialised at None, not 0). Before this fix,
+    negative values were silently swallowed by `max_score = 0`.
+    """
     label = hostname.split(":", 1)[0].lower()
     parts = label.split(".")
     # If only apex (a.b), no sub component to score
@@ -372,15 +379,16 @@ def _score_name(hostname: str) -> tuple[int, list[str]]:
         for tok in re.split(r"[-_]", lbl):
             if tok:
                 tokens.add(tok)
-    max_score = 0
+    max_score: int | None = None
     reasons: list[str] = []
     for tok in tokens:
         if tok in _NAME_SCORES:
             v = _NAME_SCORES[tok]
-            if v > max_score:
+            if max_score is None or v > max_score:
                 max_score = v
-            reasons.append(f"name token {tok!r} (+{v})")
-    return max_score, reasons
+            sign = "+" if v >= 0 else ""
+            reasons.append(f"name token {tok!r} ({sign}{v})")
+    return (max_score if max_score is not None else 0), reasons
 
 
 # Hard-killers in the title — irrespective of a juicy-looking name,
