@@ -947,6 +947,136 @@ MAIL REPORT
 QUIT_COMMANDS = {"/quit", "/bye", "/exit", "quit", "bye", "exit"}
 
 
+REPL_COMMANDS_HINT = """\
+Available REPL commands:
+  /quit  /bye  /exit      exit the harness (also: quit / bye / exit)
+
+Sticky inline flags (persist across sessions):
+  --email ADDR                  mail report destination
+  --scope PAT                   in-scope allowlist (repeatable)
+  --header "N: V"               custom HTTP header (repeatable)
+  --telegram CHAT_ID            Telegram chat id
+  --servertype BACKEND          LLM backend (auto|lmstudio|ollama|llamacpp|
+                                openai|anthropic|nvidia|gemini)
+  --model ID                    LLM model id
+  --base-url URL                OpenAI-compatible endpoint
+  --quick  |  --complete        quick triage / full pipeline
+  --auto-escalate  |  --no-escalate
+  --multi-host  |  --single-host
+  --top-hosts N                 top-N subs in multi-host
+  --strict-preflight            abort if target unreachable
+  --no-adversarial              skip post-pipeline reviewer
+  --adversarial-model ID
+  -o PATH                       session log root
+Pass an empty value to CLEAR a sticky:  --header ""   --scope ""
+
+Target formats accepted:
+  https://target.com/           URL
+  target.com                    bare host (needs TLD)
+  192.168.1.1  10.0.0.0/24       IP / CIDR
+  *.target.com                  wildcard scope (multi-host auto-on)
+  <free-text objective ≥4 words>  natural-language description
+"""
+
+
+def _damerau_levenshtein(a: str, b: str) -> int:
+    """Damerau-Levenshtein distance (Levenshtein + adjacent transposition
+    counted as ONE edit). Catches typos like 'quti' vs 'quit' or 'bey' vs
+    'bye' — which pure Levenshtein counts as 2 edits."""
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    d = [[0] * (lb + 1) for _ in range(la + 1)]
+    for i in range(la + 1):
+        d[i][0] = i
+    for j in range(lb + 1):
+        d[0][j] = j
+    for i in range(1, la + 1):
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(
+                d[i - 1][j] + 1,          # deletion
+                d[i][j - 1] + 1,          # insertion
+                d[i - 1][j - 1] + cost,   # substitution
+            )
+            # Adjacent transposition (e.g. 'ab' ↔ 'ba')
+            if (i > 1 and j > 1
+                    and a[i - 1] == b[j - 2]
+                    and a[i - 2] == b[j - 1]):
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[la][lb]
+
+
+def _did_you_mean_quit(line: str) -> str | None:
+    """If `line` is within 1 edit (Damerau-Levenshtein — counts adjacent
+    swap as 1 edit) of a QUIT command, return the canonical form.
+
+    Catches:
+      'by'   → /bye   (1 deletion)
+      'byee' → /bye   (1 insertion)
+      'bey'  → /bye   (transposition)
+      'quti' → /quit  (transposition)
+      'qut'  → /quit  (1 deletion)
+      'exi'  → /exit  (1 deletion)
+      'exti' → /exit  (transposition)
+    """
+    lo = line.strip().lower()
+    if not lo or len(lo) < 2:
+        return None
+    for bare in ("quit", "bye", "exit"):
+        if _damerau_levenshtein(lo, bare) == 1:
+            return "/" + bare
+    return None
+
+
+_TARGET_URL_RE = __import__("re").compile(
+    r"^https?://[a-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$", __import__("re").IGNORECASE)
+_TARGET_HOST_RE = __import__("re").compile(
+    r"^[a-z0-9][a-z0-9\-]*(\.[a-z0-9][a-z0-9\-]*)+(:\d+)?(/\S*)?$",
+    __import__("re").IGNORECASE)
+_TARGET_IPV4_RE = __import__("re").compile(
+    r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?(/\d{1,2})?(/\S*)?$")
+_TARGET_WILDCARD_RE = __import__("re").compile(
+    r"^\*\.[a-z0-9][a-z0-9\-\.]*\.[a-z]{2,}(:\d+)?$",
+    __import__("re").IGNORECASE)
+
+
+def _looks_like_target(line: str) -> bool:
+    """True if `line` looks like a scannable target OR a natural-language
+    objective. Rejects short garbage strings like 'by', 'foo', 'abc'.
+
+    Accepts:
+      - Full URL:            https://target.com/path
+      - Bare host with TLD:  target.com, api.target.com
+      - IPv4 / CIDR:         192.168.1.1, 10.0.0.0/24
+      - Wildcard scope:      *.target.com
+      - localhost / 127.0.0.1
+      - Natural language ≥4 words (e.g. "recon https://X, stop after 10 calls")
+    """
+    line = (line or "").strip()
+    if not line:
+        return False
+    lo = line.lower()
+    if lo in ("localhost", "127.0.0.1", "::1"):
+        return True
+    if _TARGET_URL_RE.match(line):
+        return True
+    if _TARGET_IPV4_RE.match(line):
+        return True
+    if _TARGET_WILDCARD_RE.match(line):
+        return True
+    if _TARGET_HOST_RE.match(line):
+        return True
+    # Multi-word natural-language objective — must be long enough to look
+    # like a description, not a typo. Threshold: ≥4 whitespace-separated
+    # tokens (matches "recon target.com stop after 10 calls" etc).
+    if len(line.split()) >= 4:
+        return True
+    return False
+
+
 def parse_repl_line(line: str) -> tuple[str, dict]:
     """Parse a REPL objective line, stripping inline flags.
 
@@ -1091,7 +1221,15 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
 
 
 def prompt_for_objective(is_first: bool) -> str | None:
-    """Pide objective por stdin. Devuelve el texto, o None si el user sale."""
+    """Pide objective por stdin. Devuelve el texto, o None si el user sale.
+
+    Validaciones aplicadas ANTES de arrancar el pipeline (2026-09-03):
+      1. Typo de quit-command (ej. `by` → sugiere `/bye`, no arranca scan).
+      2. `/<algo>` desconocido → lista corta de REPL commands.
+      3. El input (sin flags) debe parecer target o natural-language
+         objective — sino, muestra REPL_COMMANDS_HINT y vuelve al prompt.
+    Sin esto, escribir `by` disparaba un scan del "host by" (bug user-visible).
+    """
     try:
         if is_first:
             print("\nObjective (one-line goal for the agent). "
@@ -1110,6 +1248,35 @@ def prompt_for_objective(is_first: bool) -> str | None:
         return prompt_for_objective(is_first=is_first)
     if line.lower() in QUIT_COMMANDS:
         return None
+
+    # (1) Typo of a quit command — 1 edit away from quit/bye/exit
+    dym = _did_you_mean_quit(line)
+    if dym is not None:
+        print(f"[!] Unknown input '{line}'. Did you mean '{dym}' (exit) ?")
+        print(f"    If you meant a target, add a TLD (e.g. '{line}.com') or "
+              f"paste the full URL.")
+        return prompt_for_objective(is_first=is_first)
+
+    # (2) Slash-prefixed unknown command
+    if line.startswith("/") and line.lower() not in QUIT_COMMANDS:
+        print(f"[!] Unknown REPL command '{line}'.")
+        print(REPL_COMMANDS_HINT)
+        return prompt_for_objective(is_first=is_first)
+
+    # (3) Validate the stripped input looks like a target or objective
+    stripped, _flags = parse_repl_line(line)
+    if not stripped:
+        # Only flags were given, no actual target — nothing to scan.
+        print("[!] No target provided (only flags parsed).")
+        print(REPL_COMMANDS_HINT)
+        return prompt_for_objective(is_first=is_first)
+    if not _looks_like_target(stripped):
+        print(f"[!] '{stripped}' doesn't look like a target (URL / host with "
+              f"TLD / IP / CIDR / wildcard) or a natural-language objective "
+              f"(≥4 words).")
+        print(REPL_COMMANDS_HINT)
+        return prompt_for_objective(is_first=is_first)
+
     return line
 
 
