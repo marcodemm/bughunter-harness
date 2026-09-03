@@ -67,6 +67,71 @@ cleanup_tempfiles: true
 # Set to false to always notify (useful for debugging the pipeline).
 notify_only_if_findings: true
 
+# ─────────── Quick mode (fast triage + escalate prompt) ────────────
+# When enabled (DEFAULT), the pipeline runs a REDUCED first pass:
+#   - SKIPS: login_probe, wordpress, api_fuzzer, auth
+#   - SKIPS: adversarial review post-report
+#   - RUNS with halved MAX_ITERATIONS: fingerprint, content_discovery, web_vuln
+#     (with a system-prompt reminder telling them to skip ffuf/sqlmap/dalfox/
+#     nikto-full and prefer nuclei -tags cve,exposures -severity high,critical)
+# Duration: ~8-15 min single-host, ~15-25 min multi-host top-1.
+#
+# When the quick pass finishes, the orchestrator evaluates escalate criteria.
+# If any fires (and --no-escalate not set), it prompts Y/N (or auto-escalates
+# if --auto-escalate). If escalate = YES, the skipped agents run now on the
+# same state — no wasted work.
+#
+# CLI overrides:
+#   --complete       force full pipeline for this run (skip quick entirely)
+#   --quick          force quick even if disabled in config
+#   --auto-escalate  no prompt, escalate on criteria fire
+#   --no-escalate    never escalate; leave "Escalate suggested" in REPORT.md
+quick_mode:
+  enabled: true                # DEFAULT — fast triage first
+  escalate_min_severity: "high" # trigger escalate if any finding >= this sev
+  escalate_min_host_score: 40  # trigger escalate if a prioritized sub has
+                               # score >= this (~HIGH tier)
+  escalate_on_takeover: true   # takeover finding always escalates
+  escalate_on_auth_protected_juicy: true
+  escalate_prompt_timeout_sec: 30  # no answer → declined
+  # Techs that trigger escalate on their own (heavy CVE history, worth
+  # a full pass with sqlmap/dalfox/wpscan/etc.).
+  high_value_techs:
+    - jenkins
+    - gitlab
+    - grafana
+    - kibana
+    - portainer
+    - dokploy
+    - coolify
+    - adminer
+    - phpmyadmin
+    - webmin
+    - phpldapadmin
+    - vault
+    - keycloak
+    - elasticsearch
+    - n8n
+    - hasura
+    - superset
+    - guacamole
+    - rundeck
+    - awx
+    - argocd
+    - code-server
+    - jupyterhub
+    - odoo
+    - metabase
+    - redash
+    - switchvox
+    - sangoma
+    - asterisk
+    - freepbx
+    - wordpress
+    - drupal
+    - magento
+    - joomla
+
 # ─────────── Pre-flight reachability check ─────────────────────────
 # Before spawning any agent, the orchestrator sends a single HTTP GET
 # via python-requests to the target (10s timeout). Behavior on failure

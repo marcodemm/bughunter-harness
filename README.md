@@ -315,6 +315,43 @@ python harness.py --multi-host --top-hosts 3 --scope "*.example.com" \
 
 ---
 
+## Quick mode (default — fast triage with escalate prompt)
+
+The pipeline ships with **`quick_mode.enabled: true`** by default. Every run is a fast triage pass first:
+
+- **Skips**: `login_probe`, `wordpress`, `api_fuzzer`, `auth`, and `adversarial-review`
+- **Reduces**: `fingerprint`, `content_discovery`, `web_vuln` — MAX_ITERATIONS halved + system-prompt reminder tells them to skip heavy shell tools (`ffuf`, `sqlmap`, `dalfox`, `nikto -full`) and prefer `nuclei -tags cve,exposures -severity high,critical`
+- **Duration**: ~8-15 min single-host, ~15-25 min multi-host top-1
+
+When the quick pass finishes, the orchestrator evaluates **escalate criteria** against `state`:
+
+- Any finding with `severity >= escalate_min_severity` (default `high`)
+- Any tech in `high_value_techs` matched (jenkins / gitlab / grafana / portainer / dokploy / n8n / adminer / phpmyadmin / webmin / switchvox / wordpress …)
+- Any CVE match in `state.cves_matched`
+- Any prioritized host with `score >= escalate_min_host_score` (default 40)
+- Any takeover finding (dangling CNAME)
+
+If any criterion fires:
+
+- With `--auto-escalate` → escalates automatically
+- Otherwise → prompts `[y/N]` with a 30 s timeout (any other answer / timeout / non-TTY = declined)
+- With `--no-escalate` → never escalates; REPORT.md gets an `💡 Escalate suggested` block with the reasons
+
+When escalated, the previously-skipped agents (`login_probe`, `wordpress`, `api_fuzzer`, `auth` + `adversarial-review`) run on the accumulated `state` — no wasted work.
+
+**Overrides**:
+
+| Flag | Effect |
+|---|---|
+| `--complete` | Force full pipeline for this run (skip quick entirely) |
+| `--quick` | Force quick even if disabled in config |
+| `--auto-escalate` | Escalate on criteria fire without prompting |
+| `--no-escalate` | Never escalate; leave "Escalate suggested" in REPORT.md |
+
+Config in [`config.example.yaml → quick_mode:`](config.example.yaml).
+
+---
+
 ## Adversarial review (post-pipeline finding gate)
 
 After the report agent runs, every finding whose severity is ≥ `min_severity` (default `medium`) is sent to an LLM with a strict **7-question gate**:

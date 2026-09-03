@@ -72,6 +72,19 @@ class ReportAgent(BaseAgent):
                          "next time to abort early on this class of failure.")
             lines.append("")
 
+        # Quick-mode escalate suggested — displayed when quick_mode was on,
+        # escalate criteria fired, and the operator declined (or was
+        # non-interactive without --auto-escalate).
+        if s.get("quick_escalate_suggested"):
+            lines.append("> 💡 **Escalate suggested** — this run finished in "
+                         "QUICK mode and detected signal that warrants a "
+                         "FULL pass. Re-run with `--complete` to enable "
+                         "login_probe / wordpress / api_fuzzer / auth + "
+                         "adversarial review.")
+            for r in (s.get("quick_escalate_reasons") or [])[:8]:
+                lines.append(f"> - {r}")
+            lines.append("")
+
         lines.append(f"- **Target:** `{s.get('target')}`")
         lines.append(f"- **In-scope hosts:** `{s.get('in_scope_hosts')}`")
         lines.append(f"- **Live hosts found:** {len(s.get('live_hosts', []))}")

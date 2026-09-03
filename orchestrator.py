@@ -122,13 +122,23 @@ def _insert_before_report(order: list, cls) -> None:
     order.insert(report_idx, cls)
 
 
+def _quick_skipped_agent_names(order: list) -> list[str]:
+    """Return the names of agents that are skipped in quick mode
+    (RUNS_IN_QUICK = False). Used to print the skip list at start-up."""
+    return [getattr(cls, "NAME", "?") for cls in order
+            if not getattr(cls, "RUNS_IN_QUICK", True)]
+
+
 class Orchestrator:
     def __init__(self, cfg: dict, tool_registry,
                  target: str, in_scope: list[str] | None,
                  sessions_root: Path,
                  telegram_chat_id: str | None = None,
                  skip_preflight: bool = False,
-                 strict_preflight: bool = False):
+                 strict_preflight: bool = False,
+                 quick_mode: bool | None = None,
+                 auto_escalate: bool = False,
+                 no_escalate: bool = False):
         self.cfg = cfg
         self.tools = tool_registry
         self.target = target
@@ -139,6 +149,24 @@ class Orchestrator:
         # LLM agents may reach the target with tools that use different
         # TLS/HTTP stacks than python-requests.
         self.strict_preflight = strict_preflight
+        # Quick mode: reduced pipeline for fast triage. Skips
+        # login_probe/wordpress/api_fuzzer/auth/adversarial-review and
+        # tells the remaining agents (fingerprint/content_discovery/
+        # web_vuln) to be less exhaustive via the QUICK_MODE_REMINDER in
+        # base.py. If, at the end, meaningful signal is found (see
+        # _should_escalate) the operator is prompted (or auto-escalated)
+        # to run a FULL pass that executes the previously-skipped agents.
+        #
+        # Resolution:
+        #   quick_mode=True/False → CLI/REPL override wins
+        #   quick_mode=None       → use config.yaml quick_mode.enabled
+        qm_cfg = (cfg or {}).get("quick_mode") or {}
+        if quick_mode is None:
+            self.quick_mode = bool(qm_cfg.get("enabled", True))
+        else:
+            self.quick_mode = bool(quick_mode)
+        self.auto_escalate = auto_escalate
+        self.no_escalate = no_escalate
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.run_dir = sessions_root / run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -213,11 +241,27 @@ class Orchestrator:
         mh_cfg = self.cfg.get("multi_host") or {}
         multi_host_enabled = bool(mh_cfg.get("enabled", False))
 
+        # Propagate quick_mode flag to state so BaseAgent.run() and each
+        # agent's build_objective() can adapt (less exhaustive, halved
+        # MAX_ITERATIONS, QUICK_MODE_REMINDER appended to system prompt).
+        if self.quick_mode:
+            self.state.set("quick_mode", True)
+            print(f"[+] QUICK mode ENABLED — skipping: "
+                  f"{', '.join(_quick_skipped_agent_names(self.agent_order))}. "
+                  f"Remaining agents run in reduced-exhaustiveness mode.")
+
         with MultiAgentUI(self.agent_names) as ui:
             if multi_host_enabled and not self.state.get("target_unreachable"):
                 self._run_multi_host(mh_cfg, ui)
             else:
                 self._run_single_host(ui)
+
+            # Quick mode escalate flow: after the reduced pass, check
+            # whether the accumulated state has enough signal to warrant
+            # a full run. If so, prompt the operator (or auto-escalate)
+            # and re-execute the previously-skipped agents.
+            if self.quick_mode and not self.state.get("target_unreachable"):
+                self._maybe_escalate_from_quick(ui)
 
         elapsed = int(time.time() - self.started)
         print(f"[+] Pipeline complete in {elapsed}s. "
@@ -294,6 +338,12 @@ class Orchestrator:
     # ── single-host pipeline (default) ──────────────────────────────
     def _run_single_host(self, ui) -> None:
         for AgentCls in self.agent_order:
+            # In quick mode, skip agents that opted out via RUNS_IN_QUICK=False
+            if self.quick_mode and not getattr(AgentCls, "RUNS_IN_QUICK", True):
+                ui.hook(AgentCls.NAME, "skipped", reason="quick mode")
+                self.state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
+                ui.notify(f"skipped {AgentCls.NAME} (quick mode)")
+                continue
             self._run_one_agent(AgentCls, self.state, ui)
 
     # ── multi-host pipeline ─────────────────────────────────────────
@@ -324,6 +374,10 @@ class Orchestrator:
         for AgentCls in self.agent_order:
             name = getattr(AgentCls, "NAME", "")
             if name in repeated_names or name in pre_phase_names:
+                continue
+            if self.quick_mode and not getattr(AgentCls, "RUNS_IN_QUICK", True):
+                ui.hook(name, "skipped", reason="quick mode")
+                self.state.mark_agent_run(name, "skipped", 0.0)
                 continue
             self._run_one_agent(AgentCls, self.state, ui)
 
@@ -410,6 +464,12 @@ class Orchestrator:
         try:
             for AgentCls in self.agent_order:
                 if getattr(AgentCls, "NAME", "") in repeated_names:
+                    if self.quick_mode and not getattr(AgentCls,
+                                                        "RUNS_IN_QUICK", True):
+                        ui.hook(AgentCls.NAME, "skipped",
+                                reason="quick mode")
+                        self.state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
+                        continue
                     self._run_one_agent(AgentCls, self.state, ui)
         finally:
             # Tag findings added during this pass with sub_scanned=host
@@ -455,6 +515,127 @@ class Orchestrator:
             state.error(agent.NAME, str(e))
             ui.hook(agent.NAME, "error", err=str(e))
             ui.notify(f"{agent.NAME} raised: {e}")
+
+    # ── quick-mode escalate ─────────────────────────────────────────
+    def _maybe_escalate_from_quick(self, ui) -> None:
+        """After a quick pass, decide (heuristic + optional prompt) whether
+        to escalate to a full pass. If so, clear the quick_mode flag and
+        run every agent whose RUNS_IN_QUICK=False (login_probe, wordpress,
+        api_fuzzer, auth). The previously-run agents keep their findings."""
+        qm_cfg = (self.cfg or {}).get("quick_mode") or {}
+        should, reasons = self._should_escalate(qm_cfg)
+        if not should:
+            print("[+] QUICK complete — no escalate criteria met; skipping "
+                  "full pass. Set --complete or `quick_mode.enabled: false` "
+                  "to always run the full pipeline.")
+            self.state.set("quick_escalated", False)
+            return
+        # Print preview
+        print("\n[+] QUICK complete — potential findings detected:")
+        for r in reasons[:8]:
+            print(f"    • {r}")
+        print()
+
+        if self.no_escalate:
+            print("[+] --no-escalate set — full pass suppressed. Report "
+                  "carries an 'Escalate suggested' section for later.")
+            self.state.set("quick_escalated", False)
+            self.state.set("quick_escalate_suggested", True)
+            self.state.set("quick_escalate_reasons", reasons)
+            return
+
+        approved = self.auto_escalate
+        if not approved:
+            approved = self._prompt_escalate(qm_cfg)
+        if not approved:
+            print("[+] Escalate declined — full pass skipped. Report carries "
+                  "an 'Escalate suggested' section for later.")
+            self.state.set("quick_escalated", False)
+            self.state.set("quick_escalate_suggested", True)
+            self.state.set("quick_escalate_reasons", reasons)
+            return
+
+        # Escalate: flip flag off + run the skipped agents
+        print("[+] Escalating to FULL mode — running skipped agents...")
+        self.state.set("quick_mode", False)
+        self.state.set("quick_escalated", True)
+        self.state.set("quick_escalate_reasons", reasons)
+        # Re-execute agents that were skipped in quick mode. They read
+        # state.quick_mode=False now → full behaviour. Multi-host loop
+        # is NOT re-run (subs already scanned in quick); the skipped
+        # agents run on the primary target with the state as it is.
+        for AgentCls in self.agent_order:
+            if not getattr(AgentCls, "RUNS_IN_QUICK", True):
+                self._run_one_agent(AgentCls, self.state, ui)
+
+    def _should_escalate(self, qm_cfg: dict) -> tuple[bool, list[str]]:
+        """Return (should_escalate, human-readable reasons)."""
+        reasons: list[str] = []
+        sev_order = {"info": 0, "low": 1, "medium": 2,
+                      "high": 3, "critical": 4}
+        min_sev = str(qm_cfg.get("escalate_min_severity", "high")).lower()
+        min_rank = sev_order.get(min_sev, 3)
+        # 1) findings with severity >= min
+        for f in self.state.get("findings") or []:
+            sev = str(f.get("severity", "info")).lower()
+            if sev_order.get(sev, 0) >= min_rank:
+                reasons.append(f"{sev.upper()} finding: "
+                                f"{str(f.get('title',''))[:100]}")
+        # 2) high-value tech detected
+        hv_techs = set(str(t).lower()
+                        for t in qm_cfg.get("high_value_techs", []))
+        for t in self.state.get("detected_techs") or []:
+            tl = str(t).lower()
+            for hv in hv_techs:
+                if hv in tl:
+                    reasons.append(f"HIGH-value tech detected: {t}")
+                    break
+        # 3) CVE match
+        for c in self.state.get("cves_matched") or []:
+            reasons.append(f"CVE match: {c.get('cve','?')} on "
+                            f"{c.get('target','?')}")
+        # 4) any prioritized_hosts scoring above escalate_min_host_score
+        if qm_cfg.get("escalate_on_auth_protected_juicy", True):
+            min_score = int(qm_cfg.get("escalate_min_host_score", 40))
+            for p in (self.state.get("prioritized_hosts") or [])[:5]:
+                if int(p.get("score", 0)) >= min_score:
+                    reasons.append(f"juicy sub ranked HIGH: "
+                                    f"{p.get('host','')} "
+                                    f"(score={p.get('score')})")
+        # 5) takeover findings
+        if qm_cfg.get("escalate_on_takeover", True):
+            for f in self.state.get("findings") or []:
+                if str(f.get("agent","")) == "takeover":
+                    reasons.append(f"takeover positive: "
+                                    f"{str(f.get('title',''))[:100]}")
+        return (bool(reasons), reasons)
+
+    def _prompt_escalate(self, qm_cfg: dict) -> bool:
+        """Ask the operator whether to escalate. Returns True/False.
+
+        Behaves gracefully without a TTY (script/cron): returns False
+        immediately (no blocking read). With a TTY, uses select() with
+        the configured timeout — no answer → False."""
+        import sys, select
+        timeout = int(qm_cfg.get("escalate_prompt_timeout_sec", 30))
+        if not sys.stdin.isatty():
+            print(f"[?] No TTY — cannot prompt; declining escalate. "
+                  f"Use --auto-escalate to force in non-interactive runs.")
+            return False
+        print(f"[?] Escalate to FULL mode? "
+              f"(login_probe + wordpress + api_fuzzer + auth + "
+              f"adversarial-review — estimated 20-40 min extra) "
+              f"[y/N]  ({timeout}s timeout): ",
+              end="", flush=True)
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except Exception:
+            ready = []
+        if not ready:
+            print("(timeout — declined)")
+            return False
+        ans = sys.stdin.readline().strip().lower()
+        return ans in ("y", "yes", "s", "si", "sí")
 
     def _maybe_run_adversarial_review(self) -> None:
         """Run adversarial reviewer over findings (if enabled) and

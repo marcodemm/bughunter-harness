@@ -140,6 +140,21 @@ Same for every other tool_call — pure JSON args, no XML.
 """
 
 
+QUICK_MODE_REMINDER = """
+
+QUICK MODE ACTIVE — you are running a REDUCED, TRIAGE-focused pass:
+  - Total budget: 2-4 tool_calls MAX, then finish().
+  - SKIP heavy shell tools: no ffuf, no sqlmap, no dalfox, no nikto full,
+    no waybackurls (gau + katana are OK — fast historical URL sources).
+  - SKIP HTML deep-parsing loops (grab Server/X-Powered-By headers +
+    nuclei -tags tech ONCE, then finish).
+  - For nuclei vuln scans, prefer -tags cve,exposures -severity high,critical
+    only (skip medium/low/info tags — those are for FULL mode).
+  - Your job is to answer: is there ENOUGH signal here to warrant a
+    full scan? Not to be exhaustive.
+"""
+
+
 class BaseAgent:
     NAME: str = "base"
     DESCRIPTION: str = "Base agent"
@@ -155,6 +170,11 @@ class BaseAgent:
     # up in the report as visible duplicates.
     # The narrative summary is still saved either way.
     SKIP_AUTO_FINDINGS_FROM_FINISH: bool = False
+    # When False, this agent is SKIPPED under quick-mode (the fast triage
+    # pass). Set False in agents that only make sense in the full pipeline
+    # (login_probe / wordpress / api_fuzzer / auth). All other agents run
+    # in both modes but adapt via state.get("quick_mode") flag.
+    RUNS_IN_QUICK: bool = True
 
     def __init__(self, cfg: dict, tool_registry, run_dir: Path,
                  progress_hook=None):
@@ -306,23 +326,33 @@ class BaseAgent:
             ext_techniques_block = self._extension_techniques_block(state)
         except Exception:
             pass
+        # Quick-mode reminder: reduces the agent's exhaustiveness.
+        # The state.quick_mode flag is set by the orchestrator when
+        # running the fast triage pass.
+        quick_reminder = ""
+        max_iterations_run = self.MAX_ITERATIONS
+        if state.get("quick_mode"):
+            quick_reminder = QUICK_MODE_REMINDER
+            # Halve turns budget to force the model to hurry
+            max_iterations_run = max(3, self.MAX_ITERATIONS // 2)
         messages = [
             {"role": "system",
              "content": (self.SYSTEM_PROMPT
                          + FINISH_FORMAT_REMINDER
                          + headers_reminder
                          + ext_tools_hint
-                         + ext_techniques_block)},
+                         + ext_techniques_block
+                         + quick_reminder)},
             {"role": "user", "content": objective},
         ]
         tools = self._filtered_tool_schemas()
         transcript: list[dict] = []
         no_tool_retries = 0
 
-        while self.turns < self.MAX_ITERATIONS:
+        while self.turns < max_iterations_run:
             self.turns += 1
             self._emit("progress", turn=self.turns,
-                       max_turns=self.MAX_ITERATIONS)
+                       max_turns=max_iterations_run)
 
             resp = self._call_llm(messages, tools)
             if resp is None:

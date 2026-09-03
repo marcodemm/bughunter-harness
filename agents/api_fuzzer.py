@@ -12,6 +12,9 @@ class ApiFuzzerAgent(BaseAgent):
     DESCRIPTION = "API/GraphQL endpoint fuzzing (ffuf + param discovery)"
     MAX_ITERATIONS = 10
     TOOL_NAMES = ["run_shell", "http_get", "http_post", "finish"]
+    # Skipped in quick mode — API fuzzing is time-consuming; keep it for
+    # full mode when the operator has already triaged.
+    RUNS_IN_QUICK = False
 
     SYSTEM_PROMPT = """/no_think
 

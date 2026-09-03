@@ -17,6 +17,9 @@ class AuthAgent(BaseAgent):
     DESCRIPTION = "Auth-bypass + SSO/OAuth misconfig check"
     MAX_ITERATIONS = 10
     TOOL_NAMES = ["run_shell", "http_get", "http_post", "finish"]
+    # Skipped in quick mode — auth-bypass hunting benefits from the full
+    # endpoints_found list content_discovery builds in full mode.
+    RUNS_IN_QUICK = False
 
     SYSTEM_PROMPT = """/no_think
 

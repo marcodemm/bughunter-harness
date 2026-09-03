@@ -444,6 +444,10 @@ USAGE
   python harness.py --single-host            → force single-host (opposite)
   python harness.py --top-hosts 5            → override top_n for multi-host
   python harness.py --strict-preflight       → abort pipeline on preflight fail
+  python harness.py --quick                  → force quick triage pass
+  python harness.py --complete               → force full pipeline (skip quick)
+  python harness.py --auto-escalate          → quick→full without asking
+  python harness.py --no-escalate            → never escalate from quick
   python harness.py --legacy                 → single-agent classic loop
   python harness.py --skip-preflight         → do not check target liveness first
   python harness.py --one-shot               → single run then exit
@@ -478,6 +482,8 @@ REPL COMMANDS
                                      force single-host (opposite)
     --top-hosts N                    top-N subs to scan in multi-host mode
     --strict-preflight               abort on preflight failure (opt-in)
+    --quick / --complete             force quick triage / force full pipeline
+    --auto-escalate / --no-escalate  quick→full without prompt / never
     -o PATH                          session log destination
   Pass an empty value to clear a sticky:  --header ""    --scope ""    --email ""
 
@@ -581,6 +587,47 @@ CUSTOM HTTP HEADERS  (researcher attribution)
   nikto / wpscan / feroxbuster shell commands.
 
   Clear all with an empty value:  --header ""
+
+QUICK MODE  (fast triage pass with optional escalate to full — DEFAULT)
+  Default mode ships with `quick_mode.enabled: true`. A quick run:
+
+    * SKIPS entirely: login_probe, wordpress, api_fuzzer, auth
+      (all agents with RUNS_IN_QUICK=False)
+    * SKIPS: adversarial-review post-report
+    * RUNS with reduced budget: fingerprint / content_discovery /
+      web_vuln — MAX_ITERATIONS halved, system-prompt reminder tells
+      them to skip heavy tools (ffuf, sqlmap, dalfox, nikto full) and
+      to prefer nuclei -tags cve,exposures -severity high,critical.
+    * Duration: ~8-15 min single-host, ~15-25 min multi-host top-1.
+
+  When the quick pass finishes, the orchestrator checks a set of
+  ESCALATE criteria against `state`:
+
+    - any finding with severity >= quick_mode.escalate_min_severity
+      (default: high)
+    - any tech in quick_mode.high_value_techs matched (jenkins /
+      gitlab / grafana / portainer / dokploy / n8n / adminer /
+      phpmyadmin / webmin / switchvox / wordpress …)
+    - any CVE match in state.cves_matched
+    - any prioritized_hosts entry scoring >= escalate_min_host_score
+    - any takeover finding (dangling CNAME)
+
+  If any criterion fires (unless --no-escalate is set):
+    * with --auto-escalate: escalate automatically
+    * otherwise: prompt "Escalate to FULL mode? [y/N]" with a timeout
+      (default 30s). Any answer other than y/yes/s/si/sí → declined.
+      Non-TTY (script/cron) → declined; use --auto-escalate to force.
+
+  If declined, REPORT.md carries an "Escalate suggested" section with
+  the reasons so you can re-run with --complete later.
+
+  Overrides:
+    --complete       force full pipeline for THIS run
+    --quick          force quick even if config disabled it
+    --auto-escalate  no prompt: escalate on criteria fire
+    --no-escalate    never escalate, always leave "Escalate suggested"
+
+  Config: see quick_mode.* in config.example.yaml.
 
 MULTI-HOST MODE  (loop scan over ranked subdomains)
   Default is single-host: the pipeline scans state.live_hosts[0] only. That
@@ -1020,6 +1067,19 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
         if t == "--strict-preflight":
             overrides["strict_preflight"] = True
             i += 1; continue
+        # --quick / --complete : force quick or full pipeline for this run
+        if t == "--quick":
+            overrides["quick_mode"] = True
+            i += 1; continue
+        if t == "--complete":
+            overrides["quick_mode"] = False
+            i += 1; continue
+        if t == "--auto-escalate":
+            overrides["auto_escalate"] = True
+            i += 1; continue
+        if t == "--no-escalate":
+            overrides["no_escalate"] = True
+            i += 1; continue
         remaining.append(t)
         i += 1
     return " ".join(remaining), overrides
@@ -1068,7 +1128,10 @@ def _run_orchestrated(cfg: dict, objective: str,
                       scope_override, output_override, email_to,
                       telegram_chat_id: str | None = None,
                       skip_preflight: bool = False,
-                      strict_preflight: bool = False):
+                      strict_preflight: bool = False,
+                      quick_mode: bool | None = None,
+                      auto_escalate: bool = False,
+                      no_escalate: bool = False):
     """Run the multi-agent Orchestrator for one objective."""
     # Scope: same precedence as single-agent
     if scope_override:
@@ -1097,7 +1160,10 @@ def _run_orchestrated(cfg: dict, objective: str,
                         sessions_root=sessions_root,
                         telegram_chat_id=telegram_chat_id,
                         skip_preflight=skip_preflight,
-                        strict_preflight=strict_preflight)
+                        strict_preflight=strict_preflight,
+                        quick_mode=quick_mode,
+                        auto_escalate=auto_escalate,
+                        no_escalate=no_escalate)
     state = orch.run()
 
     # Resolve final email destination:
@@ -1242,6 +1308,31 @@ def main():
                          "tools may use a different TLS/HTTP stack than the "
                          "python-requests probe and get further. Equivalent "
                          "to setting preflight.strict: true in config.yaml.")
+    # Quick / complete mutex + escalate controls
+    quick_group = ap.add_mutually_exclusive_group()
+    quick_group.add_argument("--quick", dest="quick", action="store_true",
+                              default=None,
+                              help="Force QUICK mode for this run — reduced "
+                                   "pipeline (skip login_probe/wordpress/"
+                                   "api_fuzzer/auth + halve turns) as a fast "
+                                   "triage pass, then prompt Y/n to escalate "
+                                   "if signal warrants. Overrides config.yaml "
+                                   "→ quick_mode.enabled. Quick is the "
+                                   "default (config ships with enabled: true).")
+    quick_group.add_argument("--complete", dest="complete",
+                              action="store_true", default=None,
+                              help="Force COMPLETE (full) mode for this run "
+                                   "— all agents in the pipeline, no quick-"
+                                   "then-prompt. Overrides config.yaml → "
+                                   "quick_mode.enabled=true.")
+    ap.add_argument("--auto-escalate", action="store_true",
+                    help="In QUICK mode, if the escalate criteria fire, "
+                         "escalate WITHOUT prompting. Useful for scripts / "
+                         "cron / non-interactive runs.")
+    ap.add_argument("--no-escalate", action="store_true",
+                    help="In QUICK mode, NEVER escalate even if criteria "
+                         "fire — REPORT.md gets an 'Escalate suggested' "
+                         "section for you to trigger later with --complete.")
     ap.add_argument("--no-adversarial", action="store_true",
                     help="Disable the post-pipeline adversarial reviewer for "
                          "this run. Findings are NOT gated — every finding "
@@ -1320,6 +1411,15 @@ def main():
     session_top_hosts: int | None = args.top_hosts
     # Strict preflight sticky override (CLI wins over config.preflight.strict)
     session_strict_preflight: bool = bool(args.strict_preflight)
+    # Quick / complete sticky (3-state: True=quick, False=complete, None=cfg)
+    if args.quick:
+        session_quick_mode: bool | None = True
+    elif args.complete:
+        session_quick_mode = False
+    else:
+        session_quick_mode = None
+    session_auto_escalate: bool = bool(args.auto_escalate)
+    session_no_escalate: bool = bool(args.no_escalate)
     pending_objective = args.objective  # first-turn seed from CLI, if any
     is_first = True
 
@@ -1421,6 +1521,16 @@ def main():
             session_strict_preflight = bool(overrides["strict_preflight"])
             print(f"[+] Strict pre-flight ENABLED (sticky): a probe fail "
                   "will abort the pipeline.")
+        if "quick_mode" in overrides:
+            session_quick_mode = bool(overrides["quick_mode"])
+            print(f"[+] Mode set (sticky): "
+                  f"{'QUICK' if session_quick_mode else 'COMPLETE'}")
+        if "auto_escalate" in overrides:
+            session_auto_escalate = bool(overrides["auto_escalate"])
+            print(f"[+] auto-escalate {'ON' if session_auto_escalate else 'OFF'} (sticky)")
+        if "no_escalate" in overrides:
+            session_no_escalate = bool(overrides["no_escalate"])
+            print(f"[+] no-escalate {'ON' if session_no_escalate else 'OFF'} (sticky)")
 
         # 3. If line was just flags (no objective text), re-prompt without exiting
         if not objective:
@@ -1492,7 +1602,10 @@ def main():
                                   session_output, session_email,
                                   telegram_chat_id=session_telegram,
                                   skip_preflight=args.skip_preflight,
-                                  strict_preflight=session_strict_preflight)
+                                  strict_preflight=session_strict_preflight,
+                                  quick_mode=session_quick_mode,
+                                  auto_escalate=session_auto_escalate,
+                                  no_escalate=session_no_escalate)
         except Exception as e:
             print(f"[!] Session error: {e}")
 

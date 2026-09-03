@@ -49,6 +49,9 @@ class LoginProbeAgent(BaseAgent):
     DESCRIPTION = "Lab-only default-cred probe → harvest session cookie"
     MAX_ITERATIONS = 6
     TOOL_NAMES = ["run_shell", "http_get", "http_post", "finish"]
+    # Skipped in quick mode — lab-only default-cred probing is a full-scan
+    # activity; quick mode is for triage.
+    RUNS_IN_QUICK = False
 
     SYSTEM_PROMPT = """/no_think
 

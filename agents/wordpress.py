@@ -13,6 +13,9 @@ class WordPressAgent(BaseAgent):
     DESCRIPTION = "WordPress-specific enum + CVE match (wpscan)"
     MAX_ITERATIONS = 8
     TOOL_NAMES = ["run_shell", "http_get", "finish"]
+    # Skipped in quick mode — wpscan is slow (~5-10 min per target) and
+    # only useful in a full-scan pass.
+    RUNS_IN_QUICK = False
 
     SYSTEM_PROMPT = """/no_think
 
