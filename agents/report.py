@@ -98,14 +98,36 @@ class ReportAgent(BaseAgent):
         # Agents run — muestra `reason` cuando esta presente (importante
         # para skipped: sin reason no se sabia si el skip era por quick
         # mode, entry_condition, target unreachable, etc. Post-B7 fix).
+        #
+        # 2026-09-03: dedup por agent-name. Si el mismo agent aparece 2x
+        # (quick skipped + escalate done), mostrar UNA sola linea con el
+        # status FINAL y una nota "(re-run post-quick)" que documenta el
+        # intento previo. Antes se listaban ambos entries y confundia al
+        # operador (parecia que `wordpress` estaba skipped cuando en
+        # realidad escalo y termino OK).
         lines.append("## Agents Run")
+        _agents_seen: dict[str, dict] = {}
+        _agents_prior: dict[str, list] = {}
         for a in s.get("agents_run", []):
+            name = a.get("agent", "?")
+            if name in _agents_seen:
+                _agents_prior.setdefault(name, []).append(_agents_seen[name])
+            _agents_seen[name] = a
+        for a in _agents_seen.values():
+            name = a.get("agent", "?")
             reason = str(a.get("reason", "")).strip()
             reason_str = f" · _reason:_ {reason}" if reason else ""
+            prior = _agents_prior.get(name, [])
+            rerun_str = ""
+            if prior:
+                prev_statuses = ", ".join(
+                    f"{p.get('status')}({p.get('reason','')[:40] or 'no reason'})"
+                    for p in prior)
+                rerun_str = f" · _prior:_ {prev_statuses}"
             lines.append(
-                f"- **{a['agent']}** — {a['status']} · "
+                f"- **{name}** — {a['status']} · "
                 f"{a['elapsed_sec']}s · {a['turns']} turns · "
-                f"{a['tool_calls']} tool calls{reason_str}"
+                f"{a['tool_calls']} tool calls{reason_str}{rerun_str}"
             )
         lines.append("")
 

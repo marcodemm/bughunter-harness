@@ -587,6 +587,22 @@ class Orchestrator:
             if not getattr(AgentCls, "RUNS_IN_QUICK", True):
                 self._run_one_agent(AgentCls, self.state, ui)
 
+        # Bug fix (2026-09-03): the report agent already ran at the end of
+        # the QUICK pass (with wordpress/login_probe/api_fuzzer/auth in
+        # "skipped" status). If we don't re-run it here, the REPORT.md on
+        # disk is a stale snapshot from BEFORE the escalate. The adversarial
+        # reviewer regenerates it, but only when it actually reviews
+        # something (skipped when 0 findings ≥ min_severity — happens in
+        # info-only runs). Precedent: run 20260903T110941Z — wordpress
+        # scanned 9 min post-escalate but REPORT.md kept the "skipped" line
+        # + a false meta-check warning. Regenerate unconditionally.
+        print("[+] Escalate complete — regenerating REPORT.md with "
+              "post-escalate agent state.")
+        for AgentCls in self.agent_order:
+            if AgentCls is ReportAgent:
+                self._run_one_agent(AgentCls, self.state, ui)
+                break
+
     def _should_escalate(self, qm_cfg: dict) -> tuple[bool, list[str]]:
         """Return (should_escalate, human-readable reasons)."""
         reasons: list[str] = []
