@@ -1482,6 +1482,15 @@ def main():
         print(HELP_TEXT)
         sys.exit(0)
 
+    # Startup banner (BUGHUNTER / HARNESS / MANU + beetle, in red).
+    # Rendered to stderr so it doesn't collide with tool JSON on stdout;
+    # auto-disabled when stderr isn't a TTY (log files stay clean).
+    try:
+        from banner import print_banner
+        print_banner()
+    except Exception:
+        pass  # never let a decorative banner break the CLI
+
     ap = argparse.ArgumentParser(add_help=False,
                                  description="Autonomous local bugbounty harness.")
     ap.add_argument("--config", default=str(HERE / "config.yaml"),
