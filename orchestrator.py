@@ -165,7 +165,15 @@ class Orchestrator:
             self.quick_mode = bool(qm_cfg.get("enabled", True))
         else:
             self.quick_mode = bool(quick_mode)
-        self.auto_escalate = auto_escalate
+        # auto_escalate resolution (highest wins):
+        #   1) --no-escalate CLI  → NEVER escala (blocks everything below)
+        #   2) --auto-escalate CLI → force True
+        #   3) config.quick_mode.auto_escalate (default: true → escala sin
+        #      preguntar cuando criteria dispara; false → prompt Y/N)
+        if auto_escalate:
+            self.auto_escalate = True
+        else:
+            self.auto_escalate = bool(qm_cfg.get("auto_escalate", True))
         self.no_escalate = no_escalate
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.run_dir = sessions_root / run_id

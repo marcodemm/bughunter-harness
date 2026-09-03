@@ -140,6 +140,7 @@ Same for every other tool_call — pure JSON args, no XML.
 """
 
 
+_QUICK_MODE_REMINDER_MARKER = "quick"
 QUICK_MODE_REMINDER = """
 
 QUICK MODE ACTIVE — you are running a REDUCED, TRIAGE-focused pass:

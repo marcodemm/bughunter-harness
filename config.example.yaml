@@ -88,12 +88,19 @@ notify_only_if_findings: true
 #   --no-escalate    never escalate; leave "Escalate suggested" in REPORT.md
 quick_mode:
   enabled: true                # DEFAULT — fast triage first
+  auto_escalate: true          # DEFAULT — escala sin preguntar cuando criteria
+                               # dispara. Set false to require Y/N prompt (with
+                               # 30s timeout) — better for supervised runs.
+                               # CLI --no-escalate blocks escalate no matter
+                               # what; CLI --auto-escalate forces true for the
+                               # run.
   escalate_min_severity: "high" # trigger escalate if any finding >= this sev
   escalate_min_host_score: 40  # trigger escalate if a prioritized sub has
                                # score >= this (~HIGH tier)
   escalate_on_takeover: true   # takeover finding always escalates
   escalate_on_auth_protected_juicy: true
-  escalate_prompt_timeout_sec: 30  # no answer → declined
+  escalate_prompt_timeout_sec: 30  # (only used when auto_escalate=false)
+                                    # no answer → declined
   # Techs that trigger escalate on their own (heavy CVE history, worth
   # a full pass with sqlmap/dalfox/wpscan/etc.).
   high_value_techs:

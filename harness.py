@@ -446,7 +446,7 @@ USAGE
   python harness.py --strict-preflight       → abort pipeline on preflight fail
   python harness.py --quick                  → force quick triage pass
   python harness.py --complete               → force full pipeline (skip quick)
-  python harness.py --auto-escalate          → quick→full without asking
+  python harness.py --auto-escalate          → quick→full without asking (DEFAULT)
   python harness.py --no-escalate            → never escalate from quick
   python harness.py --legacy                 → single-agent classic loop
   python harness.py --skip-preflight         → do not check target liveness first
@@ -613,10 +613,13 @@ QUICK MODE  (fast triage pass with optional escalate to full — DEFAULT)
     - any takeover finding (dangling CNAME)
 
   If any criterion fires (unless --no-escalate is set):
-    * with --auto-escalate: escalate automatically
-    * otherwise: prompt "Escalate to FULL mode? [y/N]" with a timeout
-      (default 30s). Any answer other than y/yes/s/si/sí → declined.
-      Non-TTY (script/cron) → declined; use --auto-escalate to force.
+    * DEFAULT (auto_escalate=true in config): escalate automatically,
+      no prompt. Cambia a auto_escalate=false in config.yaml or use
+      --no-escalate to require confirmation.
+    * If quick_mode.auto_escalate=false: prompt "Escalate to FULL mode?
+      [y/N]" with a timeout (default 30s). Any answer other than
+      y/yes/s/si/sí → declined. Non-TTY (script/cron) → declined; use
+      --auto-escalate to force in that path.
 
   If declined, REPORT.md carries an "Escalate suggested" section with
   the reasons so you can re-run with --complete later.
@@ -624,8 +627,10 @@ QUICK MODE  (fast triage pass with optional escalate to full — DEFAULT)
   Overrides:
     --complete       force full pipeline for THIS run
     --quick          force quick even if config disabled it
-    --auto-escalate  no prompt: escalate on criteria fire
-    --no-escalate    never escalate, always leave "Escalate suggested"
+    --auto-escalate  force auto-escalate (redundant with the default —
+                     useful only when config has auto_escalate=false)
+    --no-escalate    NEVER escalate, always leave "Escalate suggested"
+                     (wins over auto_escalate)
 
   Config: see quick_mode.* in config.example.yaml.
 
@@ -1327,12 +1332,15 @@ def main():
                                    "quick_mode.enabled=true.")
     ap.add_argument("--auto-escalate", action="store_true",
                     help="In QUICK mode, if the escalate criteria fire, "
-                         "escalate WITHOUT prompting. Useful for scripts / "
-                         "cron / non-interactive runs.")
+                         "escalate WITHOUT prompting. THIS IS THE DEFAULT "
+                         "(quick_mode.auto_escalate: true). Flag is kept "
+                         "for explicit control and to override a config "
+                         "where auto_escalate=false.")
     ap.add_argument("--no-escalate", action="store_true",
                     help="In QUICK mode, NEVER escalate even if criteria "
                          "fire — REPORT.md gets an 'Escalate suggested' "
-                         "section for you to trigger later with --complete.")
+                         "section for you to trigger later with --complete. "
+                         "Wins over auto_escalate (both config and CLI).")
     ap.add_argument("--no-adversarial", action="store_true",
                     help="Disable the post-pipeline adversarial reviewer for "
                          "this run. Findings are NOT gated — every finding "
