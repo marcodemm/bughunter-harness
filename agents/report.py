@@ -95,13 +95,17 @@ class ReportAgent(BaseAgent):
         lines.append(f"- **CVE matches:** {len(s.get('cves_matched', []))}")
         lines.append("")
 
-        # Agents run
+        # Agents run — muestra `reason` cuando esta presente (importante
+        # para skipped: sin reason no se sabia si el skip era por quick
+        # mode, entry_condition, target unreachable, etc. Post-B7 fix).
         lines.append("## Agents Run")
         for a in s.get("agents_run", []):
+            reason = str(a.get("reason", "")).strip()
+            reason_str = f" · _reason:_ {reason}" if reason else ""
             lines.append(
                 f"- **{a['agent']}** — {a['status']} · "
                 f"{a['elapsed_sec']}s · {a['turns']} turns · "
-                f"{a['tool_calls']} tool calls"
+                f"{a['tool_calls']} tool calls{reason_str}"
             )
         lines.append("")
 
@@ -294,6 +298,102 @@ class ReportAgent(BaseAgent):
             lines.append("## Errors During Run")
             for e in s["errors"]:
                 lines.append(f"- `{e['agent']}` — {e['err']}")
+            lines.append("")
+
+        # ── Meta-check pre-summary (2026-09-03) ─────────────────────
+        # Warnings condicionales antes de la Executive Summary — señales
+        # cuando el pipeline probablemente perdio valor:
+        #   (a) CMS detectado pero agent CMS-especifico skipeado
+        #   (b) live_hosts==0 pero target seteado como http/s (fallo silencioso)
+        #   (c) 0 findings + pipeline > 10 min (posible loop LLM sin exit code)
+        _meta_warnings = []
+        try:
+            _agents_run = s.get("agents_run", []) or []
+            _agents_by_name = {a.get("agent"): a for a in _agents_run}
+            _techs = [str(t).lower() for t in s.get("detected_techs", []) or []]
+            _cms_map = {
+                "wordpress": "wordpress",
+                "drupal": "drupal",  # no dedicated agent yet
+                "joomla": "joomla",
+            }
+            for tech, agent_name in _cms_map.items():
+                if any(tech in t for t in _techs):
+                    ar = _agents_by_name.get(agent_name)
+                    if ar and str(ar.get("status")) != "done":
+                        reason = str(ar.get("reason", "no reason"))
+                        _meta_warnings.append(
+                            f"CMS **{tech}** was detected, but the "
+                            f"`{agent_name}` agent did not run (status="
+                            f"`{ar.get('status')}`, reason: _{reason}_). "
+                            f"Consider re-running with `--complete` (full mode) "
+                            f"to enable it — the CMS agent is the one that "
+                            f"converts INFO plugin detections into HIGH/"
+                            f"CRITICAL CVE findings via wpscan.")
+            # (b) live_hosts silent-fail
+            _live = s.get("live_hosts", []) or []
+            _target = str(s.get("target", "")).lower()
+            if not _live and (_target.startswith("http://")
+                              or _target.startswith("https://")):
+                _meta_warnings.append(
+                    "**Live hosts is 0** but the target is an http(s) URL. "
+                    "This usually means the recon agent's httpx tool call "
+                    "was lost by the shell wrapper (bug B3 class). The B2 "
+                    "fallback should have added the target of oficio — if "
+                    "you see this warning, the fallback did NOT trigger; "
+                    "check `state.json` and `logs` for the recon agent.")
+            # (c) 0 findings + long duration
+            _total_findings = len(s.get("findings", []) or [])
+            _total_secs = sum(float(a.get("elapsed_sec", 0) or 0)
+                              for a in _agents_run)
+            if _total_findings == 0 and _total_secs > 600:
+                _meta_warnings.append(
+                    f"Pipeline ran for **{int(_total_secs)}s** ({_total_secs/60:.1f} "
+                    f"min) but produced **0 findings**. Likely an LLM loop "
+                    f"caused by exit-code parse failure (B3 class) or a "
+                    f"silent tool wrapper truncation. Check per-agent "
+                    f"tool activity for repeated identical commands.")
+            # (d) frequent 'command timed out' — shell_timeout_sec too low
+            _logs = s.get("logs", []) or []
+            _timeout_hits = sum(
+                1 for l in _logs
+                if l.get("kind") == "shell"
+                and "command timed out" in str(l.get("msg", "")).lower())
+            if _timeout_hits >= 3:
+                _meta_warnings.append(
+                    f"Detected **{_timeout_hits} shell timeouts** during the "
+                    f"run. Nuclei/wpscan/nikto scans against a live host "
+                    f"often need more than the default 300s. Consider raising "
+                    f"`shell_timeout_sec: 900` (or 1200) in config.yaml — "
+                    f"otherwise each scan is truncated and the LLM retries, "
+                    f"burning turns.")
+            # (e) frequent 'forbidden token' — the LLM keeps hitting the
+            # command denylist. Usually means the prompt taught a shell
+            # trick that uses `&`, `$(...)`, or backticks — none of those
+            # pass the tool wrapper. Rewrite the workflow to avoid them.
+            _denylist_hits = sum(
+                1 for l in _logs
+                if l.get("kind") == "shell"
+                and "forbidden token" in str(l.get("msg", "")).lower())
+            if _denylist_hits >= 3:
+                _meta_warnings.append(
+                    f"Detected **{_denylist_hits} denylist rejections** "
+                    f"(`forbidden token`). The LLM tried command patterns "
+                    f"using `&`, `$( )`, backticks or other blocked chars. "
+                    f"Rewrite the offending agent's workflow to use "
+                    f"`; and `>` in place of `&&`/`&`, and split subshell "
+                    f"substitutions across two shell calls.")
+        except Exception:
+            pass  # meta-check NEVER breaks the report
+
+        if _meta_warnings:
+            lines.append("## ⚠️ Meta-check warnings")
+            lines.append("")
+            lines.append("The report was generated with these caveats — they "
+                         "usually mean the pipeline lost signal to a plumbing "
+                         "issue, not to genuine absence of vulnerabilities:")
+            lines.append("")
+            for w in _meta_warnings:
+                lines.append(f"- {w}")
             lines.append("")
 
         # Executive summary at the end

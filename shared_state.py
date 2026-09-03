@@ -151,7 +151,12 @@ class SharedState:
             return bool(self._data.get("session_cookies"))
 
     def mark_agent_run(self, agent: str, status: str, elapsed_sec: float,
-                       turns: int = 0, tool_calls: int = 0):
+                       turns: int = 0, tool_calls: int = 0,
+                       reason: str = ""):
+        """Record an agent's outcome. `reason` is a short human-readable
+        note explaining WHY a status was reached — especially useful for
+        `skipped` so the report tells the operator why (quick mode /
+        entry condition / target unreachable) instead of a silent skip."""
         self.append("agents_run", {
             "ts": _now_iso(),
             "agent": agent,
@@ -159,6 +164,7 @@ class SharedState:
             "elapsed_sec": round(elapsed_sec, 1),
             "turns": turns,
             "tool_calls": tool_calls,
+            "reason": (reason or "")[:200],
         })
 
     def _save_unlocked(self):

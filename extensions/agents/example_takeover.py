@@ -37,13 +37,19 @@ Heroku, Fastly, Netlify, Azure blob, etc.).
 Preferred tool: `subjack` (install: `go install github.com/haccer/subjack@latest`).
 Fallback: nuclei's `-tags takeover` template set.
 
+CRITICAL: for the nuclei fallback, ALWAYS include
+      -jsonl -o /tmp/harness-nuclei-takeover.jsonl
+so the harness parses the file (independent of stdout survival through the
+shell wrapper).
+
 Workflow (one tool_call per turn):
   1. Write subdomains to /tmp/harness-subs.txt (one per line).
   2. Run either:
        subjack -w /tmp/harness-subs.txt -t 20 -timeout 30 -ssl -v \
          -c $(go env GOPATH)/src/github.com/haccer/subjack/fingerprints.json
-     OR:
-       nuclei -l /tmp/harness-subs.txt -tags takeover -silent -rl 5 -c 5
+     OR (nuclei fallback with JSONL sink for deterministic parsing):
+       nuclei -l /tmp/harness-subs.txt -tags takeover -silent -rl 5 -c 5 \
+         -jsonl -o /tmp/harness-nuclei-takeover.jsonl
   3. finish() with any confirmed takeovers as:
        ["critical — <sub> — dangling CNAME to <service> — unclaimed"]
 
@@ -69,7 +75,24 @@ Rules:
         )
 
     def after_run(self, state, transcript):
-        """Parse subjack + nuclei-takeover output → structured findings."""
+        """Parse subjack + nuclei-takeover output → structured findings.
+
+        B6 fix (2026-09-03): parse nuclei JSONL file FIRST — nuclei is
+        instructed to emit `-jsonl -o /tmp/harness-nuclei-takeover.jsonl`
+        so the harness reads the file directly (independent of stdout
+        survival through the shell wrapper — bug B3 was hiding stdout as
+        "(no exit)" in run 20260903T094840Z).
+        """
+        try:
+            # Reuse the parser from web_vuln (same JSONL schema).
+            from agents.web_vuln import _parse_nuclei_jsonl_to_findings
+            _parse_nuclei_jsonl_to_findings(
+                state, self.NAME,
+                glob_pattern="harness-nuclei-takeover*.jsonl")
+        except Exception as e:
+            state.log(self.NAME, "warn",
+                      f"nuclei JSONL parse failed: {type(e).__name__}: {e}")
+
         # subjack: "[Vulnerable] example.foo.com -> unclaimed.s3.amazonaws.com"
         subjack_re = re.compile(
             r"\[Vulnerable\]\s+(\S+)\s+->\s+(\S+)", re.IGNORECASE)

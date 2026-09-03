@@ -171,6 +171,34 @@ Rules:
             if techs:
                 state.extend("detected_techs", sorted(techs))
 
+        # B2 fallback (2026-09-03): si tras parsear TODO no hay live_hosts
+        # pero el target original es http/https, meterlo como live host de
+        # oficio. Sin esto, sub_prioritizer skipea y toda la pipeline
+        # downstream (fingerprint/content_discovery/web_vuln) opera con
+        # live_hosts=[] aunque el target claramente respondia — visto en
+        # run 20260903T094840Z: httpx tool call devolvia (no exit) por bug
+        # B3, transcript vacio, y el target respondia HEAD 200 a ojos del
+        # operador. Este fallback rompe el fallo silencioso.
+        if not state.get("live_hosts") and state.get("target"):
+            try:
+                p = urlparse(state.get("target"))
+                if p.scheme in ("http", "https") and p.hostname:
+                    host_str = p.hostname + (f":{p.port}" if p.port else "")
+                    state.extend("live_hosts", [{
+                        "host": host_str,
+                        "scheme": p.scheme,
+                        "status": None,
+                        "title": "",
+                        "tech": [],
+                        "source": "recon-fallback",
+                    }])
+                    state.log(self.NAME, "info",
+                              f"live_hosts empty after httpx parse; added "
+                              f"target '{host_str}' as fallback live host "
+                              f"so downstream agents don't skip on gate")
+            except Exception:
+                pass
+
 
 def _append_httpx_record(live: list, rec: dict) -> None:
     """Extract a single httpx JSON record into a live_hosts dict entry.

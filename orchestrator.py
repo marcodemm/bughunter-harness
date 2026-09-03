@@ -256,6 +256,8 @@ class Orchestrator:
             self.state.set("quick_mode", True)
             print(f"[+] QUICK mode ENABLED — skipping: "
                   f"{', '.join(_quick_skipped_agent_names(self.agent_order))}. "
+                  f"auto_escalate={self.auto_escalate} "
+                  f"(post-quick, criteria matches). "
                   f"Remaining agents run in reduced-exhaustiveness mode.")
 
         with MultiAgentUI(self.agent_names) as ui:
@@ -348,9 +350,11 @@ class Orchestrator:
         for AgentCls in self.agent_order:
             # In quick mode, skip agents that opted out via RUNS_IN_QUICK=False
             if self.quick_mode and not getattr(AgentCls, "RUNS_IN_QUICK", True):
-                ui.hook(AgentCls.NAME, "skipped", reason="quick mode")
-                self.state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
-                ui.notify(f"skipped {AgentCls.NAME} (quick mode)")
+                reason = "quick mode (RUNS_IN_QUICK=False)"
+                ui.hook(AgentCls.NAME, "skipped", reason=reason)
+                self.state.mark_agent_run(AgentCls.NAME, "skipped", 0.0,
+                                           reason=reason)
+                ui.notify(f"skipped {AgentCls.NAME} ({reason})")
                 continue
             self._run_one_agent(AgentCls, self.state, ui)
 
@@ -384,8 +388,10 @@ class Orchestrator:
             if name in repeated_names or name in pre_phase_names:
                 continue
             if self.quick_mode and not getattr(AgentCls, "RUNS_IN_QUICK", True):
-                ui.hook(name, "skipped", reason="quick mode")
-                self.state.mark_agent_run(name, "skipped", 0.0)
+                reason = "quick mode (RUNS_IN_QUICK=False)"
+                ui.hook(name, "skipped", reason=reason)
+                self.state.mark_agent_run(name, "skipped", 0.0,
+                                           reason=reason)
                 continue
             self._run_one_agent(AgentCls, self.state, ui)
 
@@ -474,9 +480,10 @@ class Orchestrator:
                 if getattr(AgentCls, "NAME", "") in repeated_names:
                     if self.quick_mode and not getattr(AgentCls,
                                                         "RUNS_IN_QUICK", True):
-                        ui.hook(AgentCls.NAME, "skipped",
-                                reason="quick mode")
-                        self.state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
+                        reason = "quick mode (RUNS_IN_QUICK=False)"
+                        ui.hook(AgentCls.NAME, "skipped", reason=reason)
+                        self.state.mark_agent_run(AgentCls.NAME, "skipped",
+                                                    0.0, reason=reason)
                         continue
                     self._run_one_agent(AgentCls, self.state, ui)
         finally:
@@ -504,16 +511,20 @@ class Orchestrator:
         entry_condition + catching errors. Shared body of the single-host
         loop AND the multi-host per-sub loop."""
         if state.get("target_unreachable") and AgentCls is not ReportAgent:
-            ui.hook(AgentCls.NAME, "skipped", reason="target unreachable")
-            state.mark_agent_run(AgentCls.NAME, "skipped", 0.0)
-            ui.notify(f"skipped {AgentCls.NAME} (target unreachable)")
+            reason = "target unreachable (pre-flight strict)"
+            ui.hook(AgentCls.NAME, "skipped", reason=reason)
+            state.mark_agent_run(AgentCls.NAME, "skipped", 0.0,
+                                  reason=reason)
+            ui.notify(f"skipped {AgentCls.NAME} ({reason})")
             return
         agent = AgentCls(cfg=self.cfg, tool_registry=self.tools,
                          run_dir=self.run_dir, progress_hook=ui.hook)
         if not agent.entry_condition(state):
-            ui.hook(agent.NAME, "skipped", reason="entry condition false")
-            state.mark_agent_run(agent.NAME, "skipped", 0.0)
-            ui.notify(f"skipped {agent.NAME}")
+            reason = "entry_condition() returned False"
+            ui.hook(agent.NAME, "skipped", reason=reason)
+            state.mark_agent_run(agent.NAME, "skipped", 0.0,
+                                  reason=reason)
+            ui.notify(f"skipped {agent.NAME} ({reason})")
             return
         ui.notify(f"starting {agent.NAME}")
         try:

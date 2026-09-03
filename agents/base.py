@@ -137,6 +137,17 @@ When you call finish(), pass arguments as pure JSON:
 NEVER embed <parameter=...>...</parameter> XML tags inside the summary
 string. Findings must go in the "findings" JSON array, not inside summary.
 Same for every other tool_call — pure JSON args, no XML.
+
+ANTI-REPEAT GUARDRAIL (B8 fix — 2026-09-03):
+Before issuing a run_shell command, look at the tool_call history of THIS
+turn. If the EXACT SAME command (whitespace-collapsed) has already been
+executed in the last 3 calls, DO NOT re-run it. Assume the previous run
+applies. If the result seemed empty because the harness reported "(no exit)"
+or truncated stdout: (a) check for an output file the previous command
+wrote (`-o /tmp/…`, `> /tmp/…`) and read that file with `cat` / `head`,
+or (b) call finish() and let after_run() parse what's on disk. Re-running
+identical commands wastes turns and pollutes logs — it is a bug in the
+agent, not a fix.
 """
 
 
@@ -299,8 +310,9 @@ class BaseAgent:
         """Returns one of: 'done' | 'skipped' | 'error'."""
         started = time.time()
         if not self.entry_condition(state):
-            self._emit("skipped", reason="entry condition false")
-            state.mark_agent_run(self.NAME, "skipped", 0.0)
+            reason = "entry_condition() returned False"
+            self._emit("skipped", reason=reason)
+            state.mark_agent_run(self.NAME, "skipped", 0.0, reason=reason)
             return "skipped"
 
         self._emit("start", description=self.DESCRIPTION,
@@ -513,14 +525,30 @@ class BaseAgent:
             state.log(self.NAME, "http",
                       f"{tool} {url} → {status[:40]}")
         elif tool == "run_shell":
-            cmd = str(args.get("command", ""))[:120]
-            exit_code = ""
-            for line in result.splitlines()[:3]:
-                if line.startswith("exit="):
-                    exit_code = line.strip()
-                    break
+            # B9 cosmetic: 200 chars con elipsis explicita (antes 120 sin marca)
+            raw_cmd = str(args.get("command", ""))
+            cmd = raw_cmd[:200] + ("…" if len(raw_cmd) > 200 else "")
+            # B3 fix (2026-09-03): buscar exit=<N> en TODO el output con
+            # regex, no solo primeras 3 lineas via startswith. tools.py
+            # antepone `[WARN] host ... exit=0` cuando scope_enforcement
+            # es "warn" -> startswith('exit=') fallaba -> "(no exit)"
+            # fantasma en el 90% de tool calls del run 20260903T094840Z.
+            # Ademas, cuando tools.py rechaza el comando (ERROR: forbidden
+            # token, ERROR: command timed out, ERROR: host not in scope
+            # strict) NO hay ningun `exit=` y antes la razon se perdia -
+            # ahora la primera linea "ERROR: ..." se surface en el log
+            # para que operador (y el LLM siguiente) vea POR QUE.
+            import re as _re_exit
+            m = _re_exit.search(r"exit=(-?\d+)", result)
+            if m:
+                status_note = f"exit={m.group(1)}"
+            elif result.startswith("ERROR:"):
+                # Surface the rejection reason (denylist / timeout / scope)
+                status_note = result.splitlines()[0][:120]
+            else:
+                status_note = ""
             state.log(self.NAME, "shell",
-                      f"{cmd} → {exit_code[:40] or '(no exit)'}")
+                      f"{cmd} → {status_note[:120] or '(no exit)'}")
         elif tool == "oob_generate_token":
             state.log(self.NAME, "oob",
                       f"generated token for {args.get('vector', '?')}"

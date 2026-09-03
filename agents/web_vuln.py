@@ -25,24 +25,31 @@ using sqlmap and dalfox.
 
 MANDATORY SCAN SUITE — run in this order (one tool_call per turn):
 
+CRITICAL for EVERY nuclei call: append
+      -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
+so the harness parses the JSONL file deterministically (stdout of nuclei
+sometimes gets buffered/truncated by the tool wrapper — file always wins).
+Append (`>>`) NOT truncate if you run nuclei multiple times.
+
   1. Generic exposures (always, first):
        nuclei -u <host> -tags exposures,exposed-panels,misconfig \
-         -severity info,low,medium,high,critical -rl 5 -c 5 -silent
+         -severity info,low,medium,high,critical -rl 5 -c 5 -silent \
+         -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
      Reason: catches .git / .env / config files / debug pages / open dashboards.
 
   2. Security headers:
        nuclei -u <host> -t http/misconfiguration/http-missing-security-headers.yaml \
-         -silent
+         -silent -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
 
   3. Default credentials scan (LAB ONLY — DVWA/Juice Shop/Mutillidae/BWA/
      self-hosted lab). Skip against real bug-bounty targets:
        nuclei -u <host> -tags default-login -severity medium,high,critical \
-         -rl 5 -c 5 -silent
+         -rl 5 -c 5 -silent -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
 
   4. Per-tech CVE scan — one call per tech in detected_techs (max 5 techs).
      If a tech has known nuclei templates:
        nuclei -u <host> -tags <tech-lowercase> -severity medium,high,critical \
-         -rl 5 -c 5 -silent
+         -rl 5 -c 5 -silent -jsonl -o /tmp/harness-nuclei-webvuln.jsonl
      Common product tags nuclei supports:
        wordpress, joomla, drupal, magento, adminer, phpmyadmin, grafana,
        jenkins, gitlab, jira, confluence, nginx, apache, iis, tomcat,
@@ -135,6 +142,20 @@ Rules:
         )
 
     def after_run(self, state, transcript):
+        # B5 fix (2026-09-03): parse nuclei JSONL file(s) FIRST — the LLM
+        # is instructed to emit `-jsonl -o /tmp/harness-nuclei-webvuln.jsonl`
+        # so nuclei's own machine-readable output is authoritative. This
+        # eliminates the dependency on stdout survival through the shell
+        # wrapper (bug B3 was hiding stdout output as "(no exit)" — B5
+        # bypasses that channel entirely for nuclei findings).
+        try:
+            _parse_nuclei_jsonl_to_findings(
+                state, self.NAME,
+                glob_pattern="harness-nuclei-webvuln*.jsonl")
+        except Exception as e:
+            state.log(self.NAME, "warn",
+                      f"nuclei JSONL parse failed: {type(e).__name__}: {e}")
+
         # Parse nuclei output lines: [template-id] [protocol] [severity] URL
         pattern = re.compile(
             r"\[([\w\-]+)\]\s*\[\w+\]\s*\[(info|low|medium|high|critical)\]\s*(\S+)"
@@ -258,6 +279,82 @@ Rules:
                             recommendation=("Manually verify — dalfox flagged "
                                              "as potential XSS."),
                         )
+
+
+def _parse_nuclei_jsonl_line(line: str) -> dict | None:
+    """Return a nuclei JSONL record as a dict, or None if unparseable."""
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    import json as _j
+    try:
+        return _j.loads(line)
+    except Exception:
+        return None
+
+
+def _parse_nuclei_jsonl_to_findings(state, agent_name: str,
+                                     glob_pattern: str) -> int:
+    """Read every /tmp/<glob_pattern> file and add each nuclei record as
+    a finding to `state`. Returns the count of findings added.
+
+    Nuclei JSONL format (schema per record):
+      {"template-id":"...", "info":{"name":"...","severity":"...",
+       "description":"...","tags":[...]}, "matched-at":"URL", "type":"http"}
+    """
+    from pathlib import Path as _P
+    added = 0
+    seen_keys: set[tuple] = set()
+    tmp = _P("/tmp")
+    if not tmp.is_dir():
+        return 0
+    for f in sorted(tmp.glob(glob_pattern)):
+        try:
+            if f.stat().st_size > 20 * 1024 * 1024:
+                continue
+            for line in f.read_text(encoding="utf-8",
+                                     errors="ignore").splitlines():
+                rec = _parse_nuclei_jsonl_line(line)
+                if not rec:
+                    continue
+                template_id = rec.get("template-id") or rec.get("templateID") \
+                              or "?"
+                info = rec.get("info", {}) or {}
+                sev = str(info.get("severity", "info")).lower()
+                if sev == "info" and (template_id.endswith("-detect")
+                                       or template_id.endswith("-panel")):
+                    continue
+                url = rec.get("matched-at") or rec.get("host") \
+                      or rec.get("input") or ""
+                name = info.get("name") or template_id
+                key = (template_id, url)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                evidence = f"nuclei/{template_id} matched at {url}"
+                extractor = rec.get("extracted-results") \
+                            or rec.get("extractedResults")
+                if extractor:
+                    evidence += f" · extracted={str(extractor)[:120]}"
+                state.add_finding(
+                    agent=agent_name, severity=sev,
+                    title=f"nuclei/{template_id} on {url}",
+                    evidence=evidence[:400],
+                    recommendation=info.get("description",
+                                             f"Investigate template {template_id}")[:400],
+                )
+                if sev in ("high", "critical"):
+                    state.append("cves_matched",
+                                  {"cve": template_id, "target": url,
+                                   "evidence": name})
+                added += 1
+        except Exception:
+            continue
+    if added:
+        state.log(agent_name, "info",
+                   f"parsed {added} finding(s) from nuclei JSONL "
+                   f"file(s) matching {glob_pattern}")
+    return added
 
 
 def _primary_url(state):

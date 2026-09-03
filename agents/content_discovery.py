@@ -85,6 +85,35 @@ Rules:
         # Anything else discovered (Wayback / gau frequently returns URLs
         # from unrelated domains when a path matches) is dropped.
         from urllib.parse import urlparse as _up
+        # B4 URL validator: descarta URLs malformadas que gau/wayback/
+        # katana ocasionalmente escupen — texto narrativo del LLM URL-
+        # encoded (%5Cn), fragmentos de regex de plugins SEO en robots.txt
+        # (`(?:...)?feed`), templates literales... Sin filtro llegan al
+        # REPORT (visto en run 20260903T094840Z:
+        # `.../%5Cn%5CnRecomendaciones:%5Cn%5Cn%E2%96%BA` y
+        # `.../(?:.+/)?feed(?:/(?:.+/?)?)?$|/(?:.+/)?embed/...`).
+        _BAD_URL_MARKERS = ("(?:", "?:", "\\n", "%5cn", "|/", "\\.",
+                             "%e2%96%ba")
+
+        def _is_valid_url(u: str) -> bool:
+            if not u or not (u.startswith("http://")
+                             or u.startswith("https://")):
+                return False
+            try:
+                p = _up(u)
+            except Exception:
+                return False
+            if not p.netloc:
+                return False
+            u_low = u.lower()
+            if any(m in u_low for m in _BAD_URL_MARKERS):
+                return False
+            if p.path and len(p.path) > 1:
+                # Path que empieza por metachar regex tras el `/`
+                if re.search(r"/[?(|\\]", p.path):
+                    return False
+            return True
+
         allowed_hosts: set[str] = set()
         target = state.get("target") or ""
         try:
@@ -122,10 +151,14 @@ Rules:
 
         found: set[str] = set()
         dropped_off_scope = 0
+        dropped_invalid = 0
         for entry in transcript:
             result = str(entry.get("result", ""))
             for m in re.finditer(r"https?://[^\s\"'<>]+", result):
                 u = m.group(0)
+                if not _is_valid_url(u):
+                    dropped_invalid += 1
+                    continue
                 if _in_scope(u):
                     found.add(u)
                 else:
@@ -134,6 +167,10 @@ Rules:
             state.log(self.NAME, "info",
                       f"dropped {dropped_off_scope} URLs from other domains "
                       f"(gau/Wayback contamination) — kept only in-scope")
+        if dropped_invalid:
+            state.log(self.NAME, "info",
+                      f"dropped {dropped_invalid} malformed URLs (regex "
+                      f"fragments, LLM narrative text, escape sequences)")
         if found:
             state.extend("endpoints_found",
                          [{"url": u, "via": "content_discovery"}
