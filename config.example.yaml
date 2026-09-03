@@ -199,6 +199,24 @@ adversarial_review:
   # or set to the path of your own .md file with a custom rubric.
   prompt_template: "default"
 
+# ─────────── WPScan API token (WordPress Vulnerability DB) ──────────
+# Optional. Enables CVE lookup against the WPScan Vulnerability
+# Database when the wordpress agent runs wpscan. Without a token,
+# wpscan still enumerates plugins/versions but WON'T cross-match
+# against known CVEs → 0 CVE match even when a plugin is outdated
+# (useful info but incomplete).
+#
+# Free tier: 25 requests/day. Register: https://wpscan.com/register
+# Sourcing (highest wins):
+#   1. wpscan.api_token       (direct value in this file)
+#   2. env var wpscan.api_token_env (if api_token empty)
+# The wordpress agent injects the token as env WPSCAN_API_TOKEN before
+# every subprocess → its system prompt tells the LLM to add
+# `--api-token "$WPSCAN_API_TOKEN"` to wpscan commands when set.
+wpscan:
+  api_token: ""                        # paste your token here (25/day free tier)
+  api_token_env: "WPSCAN_API_TOKEN"    # env var used if api_token is empty
+
 # ─────────── Multi-host mode (loop scan over ranked subs) ─────────
 # When enabled: after recon + sub_prioritizer rank state.live_hosts by
 # attack-surface priority (name / status / tech / title / port heuristic),

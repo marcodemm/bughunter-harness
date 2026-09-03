@@ -3,6 +3,7 @@ Uses wpscan (if installed) + nuclei -tags wordpress.
 """
 from __future__ import annotations
 
+import os
 import re
 
 from agents.base import BaseAgent
@@ -36,15 +37,27 @@ Workflow (one tool_call per turn):
      missing so the operator installs it (`gem install wpscan`).
 
   1. wpscan --url <target> --random-user-agent --no-banner --format cli \
-       --disable-tls-checks
+       --disable-tls-checks [--api-token "$WPSCAN_API_TOKEN"]
   2. wpscan --url <target> --enumerate p,u,t --plugins-detection aggressive \
-       --random-user-agent --no-banner --format cli
+       --random-user-agent --no-banner --format cli \
+       [--api-token "$WPSCAN_API_TOKEN"]
      (this can be slow; ok to skip if the earlier call already listed plugins)
   3. nuclei -u <target> -tags wordpress -severity medium,high,critical \
        -rl 5 -c 5 -silent -jsonl -o /tmp/harness-nuclei-wordpress.jsonl
      (the harness parses this JSONL after the run — see B5 fix pattern)
   4. curl -s <target>/wp-json/wp/v2/users     (user disclosure via REST API)
   5. finish() with findings: plugins outdated, users leaked, CVEs matched
+
+WPSCAN API TOKEN:
+  If the user message says "WPScan API token: available", ADD the flag
+  `--api-token "$WPSCAN_API_TOKEN"` to every wpscan call (steps 1 & 2).
+  This unlocks CVE lookup against the WPScan Vulnerability DB — without
+  it, wpscan enumerates plugins but returns 0 CVE match even when a
+  plugin is outdated.
+  If the user message says "WPScan API token: NOT configured", OMIT the
+  flag entirely — passing an empty value makes wpscan exit with an error.
+  The env var WPSCAN_API_TOKEN is already exported by the harness — you
+  just need to reference it via "$WPSCAN_API_TOKEN".
 
 Rules:
   - One tool_call per turn.
@@ -59,11 +72,45 @@ Rules:
 
     def build_objective(self, state) -> str:
         host = _target_with_wp_evidence(state)
+        token_present = self._ensure_wpscan_token_env()
+        token_note = ("WPScan API token: available (env $WPSCAN_API_TOKEN "
+                       "exported — add --api-token \"$WPSCAN_API_TOKEN\" "
+                       "to wpscan calls)"
+                       if token_present
+                       else "WPScan API token: NOT configured (skip the "
+                             "--api-token flag; wpscan still runs but "
+                             "without CVE-DB lookup)")
         return (
             f"Target: {host}\n"
-            f"Detected techs full list: {state.get('detected_techs', [])}\n\n"
+            f"Detected techs full list: {state.get('detected_techs', [])}\n"
+            f"{token_note}\n\n"
             "Enumerate + CVE-match. Finish with findings."
         )
+
+    def _ensure_wpscan_token_env(self) -> bool:
+        """Read wpscan.api_token from cfg (or the env var it names) and
+        export it as os.environ['WPSCAN_API_TOKEN'] so the subprocess
+        that runs `wpscan --api-token "$WPSCAN_API_TOKEN"` sees it.
+
+        Returns True if a non-empty token is now in os.environ, False
+        otherwise. Never raises; a missing wpscan section means "no
+        token" which is a supported mode (wpscan still runs, just
+        without CVE-DB lookup).
+        """
+        wp_cfg = (self.cfg.get("wpscan") or {})
+        token = str(wp_cfg.get("api_token") or "").strip()
+        if not token:
+            env_name = str(wp_cfg.get("api_token_env")
+                           or "WPSCAN_API_TOKEN").strip()
+            token = os.environ.get(env_name, "").strip()
+        if not token:
+            # Ensure the env is EMPTY (not partial) so the LLM sees "no
+            # token" and skips the flag — otherwise a stale env from a
+            # prior process could leak into wpscan and confuse things.
+            os.environ.pop("WPSCAN_API_TOKEN", None)
+            return False
+        os.environ["WPSCAN_API_TOKEN"] = token
+        return True
 
     def after_run(self, state, transcript):
         # B5 fix pattern: parse nuclei JSONL sink if wordpress agent used
