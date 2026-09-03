@@ -317,7 +317,7 @@ python harness.py --multi-host --top-hosts 3 --scope "*.example.com" \
 
 ---
 
-## Quick mode (default — fast triage with escalate prompt)
+## Quick mode (default — fast triage with auto-escalate)
 
 The pipeline ships with **`quick_mode.enabled: true`** by default. Every run is a fast triage pass first:
 
