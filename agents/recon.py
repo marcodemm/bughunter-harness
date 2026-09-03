@@ -171,6 +171,13 @@ Rules:
             if techs:
                 state.extend("detected_techs", sorted(techs))
 
+        # Shodan InternetDB enrichment (2026-09-03): populate each
+        # live_host with passive intel (ports/CVEs/tags/vulns/hostnames)
+        # from Shodan's free InternetDB. Zero cost (no key, no throttle),
+        # so we do it unconditionally unless disabled in config.
+        # sub_prioritizer picks these up as a new signal.
+        self._enrich_with_shodan_internetdb(state)
+
         # B2 fallback (2026-09-03): si tras parsear TODO no hay live_hosts
         # pero el target original es http/https, meterlo como live host de
         # oficio. Sin esto, sub_prioritizer skipea y toda la pipeline
@@ -198,6 +205,68 @@ Rules:
                               f"so downstream agents don't skip on gate")
             except Exception:
                 pass
+
+
+    def _enrich_with_shodan_internetdb(self, state) -> None:
+        """For each live_host, resolve to an IP and hit Shodan InternetDB
+        (free, no API key). Populate host_record['shodan'] with:
+            {ip, ports, cpes, vulns, tags, hostnames}
+        so sub_prioritizer can bump scores on hosts with known CVEs or
+        juicy tags. On any failure the field is simply not set — never
+        breaks the pipeline.
+        """
+        if not (self.cfg.get("shodan") or {}).get(
+                "internetdb_enabled", True):
+            return
+        import ipaddress as _ip
+        import socket as _sock
+        try:
+            import requests as _rq
+        except Exception:
+            return
+        for h in state.get("live_hosts") or []:
+            host = str(h.get("host", "")).split(":", 1)[0]
+            if not host:
+                continue
+            # Already enriched (e.g. from a previous pass in multi-host)?
+            if h.get("shodan"):
+                continue
+            # Resolve to IP if hostname
+            try:
+                _ip.ip_address(host)
+                ip = host
+            except ValueError:
+                try:
+                    ip = _sock.gethostbyname(host)
+                except (_sock.gaierror, _sock.herror, OSError):
+                    continue
+            try:
+                r = _rq.get(f"https://internetdb.shodan.io/{ip}",
+                             timeout=8)
+                if r.status_code == 200:
+                    data = r.json()
+                    h["shodan"] = {
+                        "ip": ip,
+                        "ports": data.get("ports") or [],
+                        "cpes": data.get("cpes") or [],
+                        "vulns": data.get("vulns") or [],
+                        "tags": data.get("tags") or [],
+                        "hostnames": data.get("hostnames") or [],
+                    }
+                elif r.status_code == 404:
+                    h["shodan"] = {"ip": ip, "not_indexed": True}
+            except _rq.RequestException:
+                continue
+            except Exception:
+                continue
+        # Aggregate a summary log for the report / audit
+        enriched = sum(1 for h in (state.get("live_hosts") or [])
+                       if h.get("shodan") and not
+                       h["shodan"].get("not_indexed"))
+        if enriched:
+            state.log(self.NAME, "shodan",
+                       f"InternetDB enriched {enriched} live_host(s) with "
+                       f"passive intel (ports/CVEs/tags)")
 
 
 def _append_httpx_record(live: list, rec: dict) -> None:

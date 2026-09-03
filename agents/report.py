@@ -136,15 +136,16 @@ class ReportAgent(BaseAgent):
         if prioritized:
             lines.append(f"## Subdomain Prioritization ({len(prioritized)} ranked)")
             lines.append("")
-            lines.append("| # | Host | Score | Tier | Name | Status | Tech | Title | Ports |")
-            lines.append("|---|------|-------|------|------|--------|------|-------|-------|")
+            lines.append("| # | Host | Score | Tier | Name | Status | Tech | Title | Ports | Shodan |")
+            lines.append("|---|------|-------|------|------|--------|------|-------|-------|--------|")
             for i, p in enumerate(prioritized[:30], 1):
                 c = p.get("components", {})
                 lines.append(
                     f"| {i} | `{p.get('host','')}` | {p.get('score','')} | "
                     f"{p.get('tier','')} | {c.get('name',0)} | "
                     f"{c.get('status',0)} | {c.get('tech',0)} | "
-                    f"{c.get('title',0)} | {c.get('ports',0)} |"
+                    f"{c.get('title',0)} | {c.get('ports',0)} | "
+                    f"{c.get('shodan',0)} |"
                 )
             if len(prioritized) > 30:
                 lines.append(f"| … | (+{len(prioritized)-30} more) |")

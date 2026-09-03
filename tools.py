@@ -157,6 +157,26 @@ class ToolRegistry:
                     n, v = n.strip(), v.strip()
                     if n and v:
                         self.custom_headers[n] = v
+        # ── Shodan (2026-09-03) ────────────────────────────────────
+        # InternetDB (free, no key, no throttle) is ALWAYS available.
+        # Pro (https://api.shodan.io/shodan/host/search) requires an API
+        # key AND has a per-run throttle to protect the operator's quota.
+        shodan_cfg = cfg.get("shodan") or {}
+        self.shodan_api_key = str(shodan_cfg.get("api_key") or "").strip()
+        if not self.shodan_api_key:
+            import os as _os
+            env_name = str(shodan_cfg.get("api_key_env")
+                           or "SHODAN_API_KEY").strip()
+            self.shodan_api_key = _os.environ.get(env_name, "").strip()
+        try:
+            self.shodan_max_pro_calls = int(
+                shodan_cfg.get("max_pro_calls_per_run", 2))
+        except (TypeError, ValueError):
+            self.shodan_max_pro_calls = 2
+        self.shodan_pro_calls_made = 0
+        self.shodan_internetdb_enabled = bool(
+            shodan_cfg.get("internetdb_enabled", True))
+
         # Extension tools — discovered by extension_loader.discover_tools()
         # at ToolRegistry construction. Adds binaries to SHELL_ALLOWLIST and
         # exposes prompt hints to agents via extension_tools_prompt_hint().
@@ -280,6 +300,51 @@ class ToolRegistry:
                 },
             }},
             {"type": "function", "function": {
+                "name": "shodan_internetdb",
+                "description": (
+                    "Query Shodan's free InternetDB service (NO API key, "
+                    "no per-account rate limit). Given an IPv4/IPv6 "
+                    "address, returns known open ports, CVE ids, tags "
+                    "(admin, database, iot, vpn, …) and hostnames. "
+                    "Zero-cost passive intel — prefer this over active "
+                    "nmap/nuclei when all you need is 'what does this "
+                    "host look like from the outside?'. Returns 404 if "
+                    "the IP is not indexed by Shodan yet."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ip": {"type": "string",
+                                "description": "IPv4 or IPv6 (no hostname, no port)"},
+                    },
+                    "required": ["ip"],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "shodan_search",
+                "description": (
+                    "Query the Shodan Pro search API (paid quota — use "
+                    "SPARINGLY). Runs a Shodan dork like "
+                    "`http.favicon.hash:-1234567890`, `org:\"Acme Corp\"`, "
+                    "`ssl.jarm:xxx`, `product:jenkins country:US`. Only "
+                    "useful for pivots that InternetDB cannot answer (asset "
+                    "discovery by favicon, JARM fingerprint, org filter, "
+                    "cert SAN, …). The harness enforces a MAX of N calls "
+                    "per run (config.shodan.max_pro_calls_per_run, default "
+                    "2) to protect the operator's quota. Returns ERROR if "
+                    "no API key is configured — fall back to shodan_internetdb "
+                    "in that case."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                   "description": "Shodan dork syntax"},
+                        "limit": {"type": "integer",
+                                   "description": "Max hits (1-20, default 5)"},
+                    },
+                    "required": ["query"],
+                },
+            }},
+            {"type": "function", "function": {
                 "name": "oob_generate_token",
                 "description": ("Generate a unique OOB callback token URL for "
                                 "blind vulnerability payloads (SSRF, XSS, XXE). "
@@ -327,6 +392,12 @@ class ToolRegistry:
                                                         "application/json"))
             if name == "run_shell":
                 return self._shell(args["command"])
+            if name == "shodan_internetdb":
+                return self._shodan_internetdb(args.get("ip", ""))
+            if name == "shodan_search":
+                return self._shodan_search(
+                    args.get("query", ""),
+                    args.get("limit", 5))
             if name == "oob_generate_token":
                 return self._oob_token(args["vector"], args["label"])
             return f"ERROR: unknown tool '{name}'"
@@ -471,6 +542,107 @@ class ToolRegistry:
         return (f"{warn_prefix}exit={proc.returncode}\n"
                 f"--- stdout (first 8KB) ---\n{out}\n"
                 f"--- stderr (first 2KB) ---\n{err}")
+
+    # ── Shodan ─────────────────────────────────────────────────
+    def _shodan_internetdb(self, ip: str) -> str:
+        """Query Shodan InternetDB — free, no key, no throttle.
+
+        Endpoint: https://internetdb.shodan.io/<ip>
+        Returns JSON {ip, ports, cpes, hostnames, tags, vulns} for
+        indexed IPs, or 404 for uncovered ones (~9M IPs in Shodan).
+        """
+        if not self.shodan_internetdb_enabled:
+            return ("ERROR: shodan_internetdb disabled in config "
+                    "(shodan.internetdb_enabled=false).")
+        if not ip or not ip.strip():
+            return "ERROR: empty IP"
+        ip = ip.strip()
+        import ipaddress as _ip
+        try:
+            _ip.ip_address(ip)
+        except ValueError:
+            return (f"ERROR: '{ip}' is not a valid IP. This tool takes "
+                    "an IP; resolve a hostname first (dig +short A <host>).")
+        self.limiter.wait()
+        try:
+            r = requests.get(f"https://internetdb.shodan.io/{ip}",
+                              timeout=self.http_timeout)
+        except requests.RequestException as e:
+            return f"ERROR: InternetDB request failed: {type(e).__name__}: {e}"
+        if r.status_code == 404:
+            return (f"InternetDB: no data for {ip} "
+                    "(IP not indexed by Shodan — internal, dark, or new).")
+        if r.status_code != 200:
+            return f"InternetDB: HTTP {r.status_code} for {ip}"
+        return f"InternetDB {ip}:\n{r.text[:4096]}"
+
+    def _shodan_search(self, query: str, limit=5) -> str:
+        """Query Shodan Pro search API — quota-protected.
+
+        Enforces max_pro_calls_per_run so the LLM can't blast the paid
+        quota. Requires shodan.api_key (or env $SHODAN_API_KEY).
+        """
+        if not query or not str(query).strip():
+            return "ERROR: empty Shodan query"
+        if not self.shodan_api_key:
+            return ("ERROR: Shodan Pro API key not configured. Set "
+                    "shodan.api_key in config.yaml (or export "
+                    "$SHODAN_API_KEY) to enable Pro search. Meanwhile "
+                    "shodan_internetdb (free) is still available.")
+        if self.shodan_pro_calls_made >= self.shodan_max_pro_calls:
+            return (f"ERROR: Shodan Pro throttle exhausted for this run "
+                    f"({self.shodan_pro_calls_made}/"
+                    f"{self.shodan_max_pro_calls} calls used). Raise "
+                    "shodan.max_pro_calls_per_run in config.yaml if this "
+                    "run truly needs more Pro calls.")
+        try:
+            lim = int(limit) if limit else 5
+        except (TypeError, ValueError):
+            lim = 5
+        lim = max(1, min(20, lim))
+        self.limiter.wait()
+        try:
+            r = requests.get("https://api.shodan.io/shodan/host/search",
+                              params={"key": self.shodan_api_key,
+                                      "query": str(query), "limit": lim},
+                              timeout=self.http_timeout)
+        except requests.RequestException as e:
+            return f"ERROR: Shodan Pro request failed: {type(e).__name__}: {e}"
+        self.shodan_pro_calls_made += 1
+        if r.status_code == 401:
+            return ("ERROR: Shodan API 401 — key rejected. "
+                    "Verify config.shodan.api_key.")
+        if r.status_code == 429:
+            return ("ERROR: Shodan API 429 — rate-limited by the "
+                    "provider itself (not our throttle).")
+        if r.status_code != 200:
+            return f"ERROR: Shodan API HTTP {r.status_code}: {r.text[:400]}"
+        try:
+            data = r.json()
+            matches = data.get("matches", []) or []
+            total = data.get("total", len(matches))
+            slim = [{
+                "ip_str": m.get("ip_str"),
+                "port": m.get("port"),
+                "hostnames": m.get("hostnames", []) or [],
+                "org": m.get("org"),
+                "product": m.get("product"),
+                "os": m.get("os"),
+                "country": (m.get("location") or {}).get("country_name"),
+                "asn": m.get("asn"),
+                "http_title": (m.get("http") or {}).get("title"),
+                "cpes": m.get("cpe", []) or [],
+                "vulns": list((m.get("vulns") or {}).keys()) if isinstance(
+                    m.get("vulns"), dict) else (m.get("vulns") or []),
+            } for m in matches[:lim]]
+            import json as _j
+            return (f"Shodan search {query!r} — total={total}, "
+                    f"showing {len(slim)}. "
+                    f"Pro quota used {self.shodan_pro_calls_made}/"
+                    f"{self.shodan_max_pro_calls}:\n"
+                    f"{_j.dumps(slim, indent=2)[:6000]}")
+        except Exception as e:
+            return f"ERROR: parse failed: {type(e).__name__}: {e}"
 
     def _oob_token(self, vector: str, label: str) -> str:
         if not self.oob_host:

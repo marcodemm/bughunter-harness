@@ -447,6 +447,54 @@ def _is_bot_challenge_page(host_record: dict) -> bool:
     return sum([title_hit, tech_hit, denied_status]) >= 2
 
 
+# ── Signal 7: Shodan InternetDB (2026-09-03) ────────────────────────
+# `host_record["shodan"]` is populated by recon.after_run when the free
+# InternetDB service has data for the resolved IP. Signals:
+#   * known CVE match → +25 (biggest signal — passive proof of vuln)
+#   * juicy tag       → +15 (admin_panel / database / iot / vpn / …)
+#   * rare port open  → +10 (redis 6379 / mongo 27017 / elastic 9200 …)
+# Cap 30 total so a single super-juicy Shodan record can't dominate.
+_SHODAN_JUICY_TAGS = {
+    "admin", "admin_panel", "database", "iot", "vpn",
+    "cctv", "ics", "scada", "self-signed", "compromised",
+    "malware", "cloud", "cpanel", "webmin", "kubernetes",
+    "docker", "elk", "wordpress-vuln",
+}
+_SHODAN_RARE_PORTS = {
+    6379, 27017, 9200, 3306, 5432, 2375, 2376, 5601,
+    5984, 11211, 9418, 5900, 3389, 9000, 8009,
+}
+
+def _score_shodan(host_record: dict) -> tuple[int, list[str]]:
+    shodan = host_record.get("shodan") or {}
+    if not shodan or shodan.get("not_indexed"):
+        return 0, []
+    score = 0
+    reasons: list[str] = []
+    vulns = shodan.get("vulns") or []
+    if vulns:
+        score += 25
+        reasons.append(
+            f"shodan: {len(vulns)} known CVE(s) "
+            f"[{', '.join(str(v) for v in vulns[:3])}"
+            f"{'…' if len(vulns) > 3 else ''}] (+25)")
+    tags = shodan.get("tags") or []
+    matched_tags = [t for t in tags if t in _SHODAN_JUICY_TAGS]
+    if matched_tags:
+        score += 15
+        reasons.append(
+            f"shodan: juicy tags "
+            f"[{', '.join(matched_tags[:4])}] (+15)")
+    ports = shodan.get("ports") or []
+    rare_open = [p for p in ports if p in _SHODAN_RARE_PORTS]
+    if rare_open:
+        score += 10
+        reasons.append(
+            f"shodan: rare service ports open "
+            f"[{', '.join(str(p) for p in rare_open[:5])}] (+10)")
+    return min(30, score), reasons
+
+
 # ── Combine ─────────────────────────────────────────────────────────
 def score_host(host_record: dict) -> dict:
     hostname = str(host_record.get("host", ""))
@@ -463,9 +511,10 @@ def score_host(host_record: dict) -> dict:
     ti_s, ti_r = _score_title(title)
     po_s, po_r = _score_ports(ports)
     pen_s, pen_r = _penalty_random(hostname)
+    sh_s, sh_r = _score_shodan(host_record)
 
-    total = n_s + st_s + te_s + ti_s + po_s + pen_s
-    reasons = n_r + st_r + te_r + ti_r + po_r + pen_r
+    total = n_s + st_s + te_s + ti_s + po_s + pen_s + sh_s
+    reasons = n_r + st_r + te_r + ti_r + po_r + pen_r + sh_r
 
     # Hard cap: parking pages / for-sale / expired titles → LOW tier no matter
     # what a juicy-looking name suggests. This handles `test.example.com` with
@@ -497,6 +546,7 @@ def score_host(host_record: dict) -> dict:
         "components": {
             "name": n_s, "status": st_s, "tech": te_s,
             "title": ti_s, "ports": po_s, "penalty": pen_s,
+            "shodan": sh_s,
             "cf_challenge": -30 if cf_challenge else 0,
         },
         "reasons": reasons,

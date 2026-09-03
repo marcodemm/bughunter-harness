@@ -217,6 +217,31 @@ wpscan:
   api_token: ""                        # paste your token here (25/day free tier)
   api_token_env: "WPSCAN_API_TOKEN"    # env var used if api_token is empty
 
+# ─────────── Shodan (free InternetDB + optional Pro w/ throttle) ─────
+# Two tiers:
+#   1) InternetDB (https://internetdb.shodan.io/<ip>) — FREE, no API
+#      key, no rate limit. The recon agent enriches every live_host
+#      with passive intel (open ports, known CVE ids, tags, vulns)
+#      automatically; sub_prioritizer picks these up as a new signal
+#      that bumps scores of hosts Shodan has already indexed as
+#      interesting. Zero cost, never disabled unless internetdb_enabled=false.
+#   2) Pro (https://api.shodan.io/shodan/host/search) — PAID. Only
+#      activated if api_key is set. The tool `shodan_search` becomes
+#      available to the LLM (favicon_hash pivots, org: filters, JARM,
+#      cert SAN, …) but with a hard throttle: max_pro_calls_per_run
+#      calls MAX per run. Protects the operator's quota — the LLM
+#      cannot burn it accidentally.
+#
+# Sourcing (highest wins):
+#   1. shodan.api_key       (direct value in this file)
+#   2. env var shodan.api_key_env (if api_key empty)
+# Register Pro key at https://account.shodan.io (paid).
+shodan:
+  api_key: ""                          # paste your Pro key here (optional)
+  api_key_env: "SHODAN_API_KEY"        # env var used if api_key is empty
+  max_pro_calls_per_run: 2             # Pro throttle (0 = disable Pro entirely)
+  internetdb_enabled: true             # set false to disable InternetDB too
+
 # ─────────── Multi-host mode (loop scan over ranked subs) ─────────
 # When enabled: after recon + sub_prioritizer rank state.live_hosts by
 # attack-surface priority (name / status / tech / title / port heuristic),
