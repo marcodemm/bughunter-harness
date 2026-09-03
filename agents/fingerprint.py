@@ -669,17 +669,30 @@ Rules:
             getattr(self, "finish_findings", []) or [])
         aggregated.extend(finish_findings_extras)
 
-        # Fallback keyword scan across everything (never enough on its own,
-        # but catches products spoken about in HTML text)
-        joined_text = "\n".join(
-            str(e.get("result", "")) for e in transcript).lower()
-        for kw in TECH_KEYWORDS:
-            if kw in joined_text and not any(
-                    d["tech"] == kw for d in aggregated):
-                aggregated.append({"tech": kw, "version": "",
-                                    "evidence": f"keyword '{kw}' present in "
-                                                 f"transcript",
-                                    "source": "keyword scan"})
+        # PP3 fix (2026-09-03): keyword scan fallback REMOVED.
+        #
+        # The old fallback iterated TECH_KEYWORDS and joined ALL result
+        # strings from the transcript, treating any substring match as
+        # evidence of that tech on the CURRENT host. This produced two
+        # classes of false positive:
+        #   (1) LLM narrative: the model mentions "wordpress" in its
+        #       natural-language reply → gets attributed to the host
+        #       being fingerprinted, even if the host runs something else.
+        #   (2) Multi-host context bleed: the same LLM history/context
+        #       contains WP mentions from an earlier sub → attributed
+        #       to the current sub (cpanel etc.).
+        # Downstream this misdirected the wordpress agent to scan cpanel
+        # for 22 min with 0 findings in run 20260903T175056Z.
+        #
+        # Real tech detection now comes ONLY from HTTP-observed evidence:
+        #   - curl headers (Server / X-Powered-By / Set-Cookie name)
+        #   - HTML meta generator + wp-content/plugins asset URLs + comments
+        #   - nuclei -tags tech templates (which observe real responses)
+        #   - model finish() summary strings (already filtered by
+        #     _looks_like_tech_name so long prose can't slip through)
+        # Every source above is a whitelist entry — if a new detection
+        # channel is added, extend the corresponding parser, don't bring
+        # back the keyword scan.
 
         # Deduplicate by (tech, version), preserving the FIRST occurrence
         # (usually the most authoritative — Server / meta before HTML noise)

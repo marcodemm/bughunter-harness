@@ -415,14 +415,86 @@ class Orchestrator:
         if not selected:
             # Nothing meets min_score — better to loop top-N than nothing
             selected = prioritized[:top_n]
-        ui.notify(f"multi-host: iterating {len(selected)} sub(s) "
-                  f"(top_n={top_n}, min_score={min_score})")
+
+        # PP1 fix (2026-09-03): the original target ALWAYS runs Phase 2
+        # first, AND out-of-scope subs are diverted to a report-only
+        # "Suggested Additional Targets" section instead of being scanned
+        # automatically.
+        #
+        # Before this fix, sub_prioritizer's top-ranked sub (e.g. a cpanel
+        # host promoted to score 56 while the actual WP host `www` ranked
+        # 33) became the ONLY attack target — every downstream agent
+        # scanned the wrong host for 55+ min while the target the operator
+        # asked for got zero coverage. Symptoms seen in a real run:
+        #
+        #   - wpscan ran against `cpanel.<target>` (which isn't WordPress).
+        #   - web_vuln nuclei ran with `-tags cve,nginx` against a cPanel
+        #     host that doesn't run nginx.
+        #   - content_discovery crawled `cpanel?locale=xx` → 31 dupes.
+        #   - `www.<target>` (the operator's actual target) never scanned
+        #     in Phase 2 despite being in state.live_hosts.
+        #
+        # New behaviour:
+        #   (a) The original state.target's hostname is promoted to the
+        #       FRONT of the queue with a synthetic tier "ORIGINAL". This
+        #       guarantees at least one pass against what the operator
+        #       explicitly asked for.
+        #   (b) Every other prioritized sub must pass the scope gate
+        #       (state.tools.scope.is_in_scope) before being iterated.
+        #       Subs failing the gate are recorded in
+        #       state.suggested_additional_targets → REPORT.md prints them
+        #       under a dedicated "## Suggested Additional Targets" section
+        #       so the operator can investigate them manually (separate
+        #       engagement / expanded scope).
+        from urllib.parse import urlparse as _up
+        orig_host = _up(self.state.get("target") or "").hostname
+        in_scope_selected: list[dict] = []
+        out_of_scope_selected: list[dict] = []
+        for p in selected:
+            host = str(p.get("host", ""))
+            if not host:
+                continue
+            if host == orig_host:
+                continue  # will be added at the front separately
+            if self.tools.scope.is_in_scope(host):
+                in_scope_selected.append(p)
+            else:
+                out_of_scope_selected.append(p)
+
+        if out_of_scope_selected:
+            self.state.set("suggested_additional_targets",
+                            out_of_scope_selected)
+            ui.notify(f"multi-host: {len(out_of_scope_selected)} sub(s) "
+                      f"marked HIGH but OUT-OF-SCOPE — listed under "
+                      f"'Suggested Additional Targets' in REPORT.md; NOT "
+                      f"scanned automatically.")
+
+        # Prepend the original target as the FIRST pass. If we have a
+        # live_host record for it, use its actual scheme/tech; else
+        # synthesize.
+        orig_live_record = None
+        for h in (self.state.get("live_hosts") or []):
+            if str(h.get("host", "")).split(":", 1)[0] == orig_host:
+                orig_live_record = h
+                break
+        orig_pri = {
+            "host": orig_host or self.state.get("target", ""),
+            "score": 999,
+            "tier": "ORIGINAL",
+            "components": {"note": "operator-supplied target — always first"},
+        }
+        final_queue = [orig_pri] + in_scope_selected
+
+        ui.notify(f"multi-host: Phase 2 queue = {len(final_queue)} host(s) — "
+                  f"original target FIRST + {len(in_scope_selected)} in-scope "
+                  f"sub(s) (top_n={top_n}, min_score={min_score}, "
+                  f"{len(out_of_scope_selected)} out-of-scope diverted)")
 
         # ── PHASE 2 ────────────────────────────────────────────────
-        for i, host_pri in enumerate(selected):
+        for i, host_pri in enumerate(final_queue):
             self._loop_repeated_agents_on_sub(
                 host_pri=host_pri, repeated_names=repeated_names,
-                ui=ui, index=i, total=len(selected))
+                ui=ui, index=i, total=len(final_queue))
 
         # ── PHASE 3 ────────────────────────────────────────────────
         for AgentCls in self.agent_order:

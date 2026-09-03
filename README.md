@@ -212,6 +212,8 @@ Extension agents (drop-in under `extensions/agents/*.py`) splice themselves acco
 
 **REPL guard** — the objective prompt catches typos of `/quit`, `/bye`, `/exit` (via Damerau-Levenshtein distance 1 — e.g. `by`, `quti`, `exti`) and validates that your input looks like a scannable target (URL / host with TLD / IP / CIDR / wildcard) or a ≥4-word natural-language objective. It prints an inline command reference on any unrecognized input instead of starting a scan against garbage.
 
+**Auto-inferred in-scope** — when you launch a scan without `--scope`, the harness parses the target for a hostname and populates `state.in_scope_hosts` with `[hostname]` automatically. Prints `[+] No --scope given; inferred in_scope_hosts from target: [www.target.com]`. Without this fallback the multi-host filter (see below) would have no scope guardrail — any sub_prioritizer HIGH-ranked sub would slip through. Pass `--scope 'pattern'` (repeatable) explicitly when you need wildcards or additional patterns beyond the target's own hostname.
+
 **Full help** (all flags and behaviours):
 ```bash
 python harness.py --help
@@ -275,8 +277,19 @@ Default is single-host: the pipeline scans `state.live_hosts[0]` only. That's fi
 **Enable multi-host manually** with `--multi-host` (per run) or `multi_host.enabled: true` in `config.yaml`. The pipeline splits into 3 phases:
 
 - **Phase 1** (once): `recon → sub_prioritizer` (+ any non-repeated agent, e.g. an extension like `takeover`).
-- **Phase 2** (once per top-N sub): `fingerprint → content_discovery → login_probe → web_vuln → wordpress → api_fuzzer → auth`.
+- **Phase 2** (once per host in queue): `fingerprint → content_discovery → login_probe → web_vuln → wordpress → api_fuzzer → auth`.
 - **Phase 3** (once): `report`.
+
+### Phase 2 queue selection — original target always first, out-of-scope subs diverted
+
+The Phase 2 queue is built from two sources, in this order:
+
+1. **The original target** the operator supplied — ALWAYS runs first, as a synthetic entry with `tier=ORIGINAL`. Guarantees at least one full-pipeline pass against what you actually asked for.
+2. **Sub_prioritizer's top-N subs** — but ONLY those whose hostname matches your in-scope allowlist (`ScopeChecker.is_in_scope(host)`).
+
+Subs that `sub_prioritizer` marked HIGH but that are **out of scope** never get scanned. They're recorded in `state.suggested_additional_targets` and surfaced in `REPORT.md` under a `## Suggested Additional Targets` section — you decide whether to expand scope and re-run, or leave them alone.
+
+**Why this matters**: without the filter, a sub_prioritizer ranking of `cpanel.target.com` (admin-panel keyword → score 56) above `www.target.com` (bare www → score 33) would silently REPLACE `www` in the scan queue. Every downstream agent (wordpress, web_vuln, content_discovery) would attack cpanel — 55+ min wasted on the wrong host, zero coverage of the target the operator explicitly asked for. Now the operator's target is guaranteed to run, and admin subs surface as suggestions rather than hijacked scans.
 
 ### `sub_prioritizer` — the ranker
 
@@ -537,6 +550,8 @@ Extensions are pure additions: they never modify or shadow core behaviour. A mal
 - **Pre-flight reachability check** — the orchestrator sends a single HTTP GET to the target before spawning any agent. By default (soft-warn) a failure is a `⚠️ Pre-flight warning` banner and the pipeline continues — the agents' Go/curl-based tools use different TLS/HTTP stacks than python-requests and often pass where the probe hits JA3/JA4 blocking or a fussy handshake. Pass `--strict-preflight` (or `preflight.strict: true` in config) to abort instead — REPORT.md then carries a `🚨 TARGET UNREACHABLE` banner and no LLM turns burn against a dead host. Pass `--skip-preflight` to not probe at all.
 - **Cleanup** — temp files created by the agents (`/tmp/harness-*`, `/tmp/gau_*`, `/tmp/nuclei_*`, …) are wiped after each run.
 - **Meta-check warnings in REPORT.md** — a `⚠️ Meta-check warnings` block is prepended to the executive summary whenever the pipeline hit a class of plumbing issue: WordPress detected but `wpscan` missing (with install command), WPScan API daily quota exhausted, Shodan Pro credits exhausted, 3+ shell timeouts (suggests raising `shell_timeout_sec`), 3+ denylist rejections (LLM tried `&`/`$( )`/backticks — see the substitute cheat-sheet in the base prompt), `live_hosts=0` with an HTTP target, or 0 findings after >10 min of run time. Each warning tells the operator exactly WHY the pipeline lost signal, distinguishing "target is genuinely clean" from "our plumbing dropped data".
+- **HTTP-observed tech evidence only** — the `fingerprint` agent builds `state.detected_techs` and per-tech findings from HTTP-observed sources only: `Server` / `X-Powered-By` / `Set-Cookie name` headers, `<meta name="generator">`, `/wp-content/plugins|themes/…?ver=` asset URLs, HTML comments with product+version, `nuclei -tags tech` templates, and the model's own `finish()` summary strings (already sanity-checked by `_looks_like_tech_name` — long prose can't slip through). A raw "keyword in transcript" scan is intentionally NOT done: it produced false positives (e.g. the LLM mentioning `wordpress` in its narrative attributed WP to whatever host the current agent was fingerprinting, misdirecting the wordpress agent to non-WP subs).
+- **Custom HTTP headers (attribution)** — `custom_headers` in `config.yaml` (e.g. `{X-HackerOne-Researcher: yourhandle}`) get auto-injected on every `http_get` / `http_post`, and the system prompt of every LLM agent carries an ALL-CAPS banner at the TOP with a per-tool cheat-sheet (`curl -H`, `nuclei -H`, `wpscan --headers`, `sqlmap --headers=`, `httpx -H`, `ffuf -H`, …). A one-liner reminder is also appended to EVERY user objective so the requirement stays in-context across turns. Skipping the header on real bug-bounty programs typically means your traffic is treated as unauthorized — some VDPs require it explicitly (e.g. Grayback `X-Grayback: <username>`).
 - **Nuclei JSONL sink + metrics** — every nuclei call the agents run writes to `/tmp/harness-nuclei-*.jsonl` (deterministic output independent of stdout truncation). The parser logs `total_lines=N json_records=M → findings_added=X` so you can tell the difference between "nuclei found nothing" and "nuclei found 40 things but all got filtered as info/-detect".
 
 ---

@@ -114,8 +114,27 @@ Rules:
         return state.has_live_http()
 
     def build_objective(self, state) -> str:
-        techs = state.get("detected_techs", [])[:8]
         host = _primary_url(state)
+        # PP6 fix (2026-09-03): pick techs from the HOST being scanned,
+        # NOT from state.detected_techs (which is the GLOBAL aggregated
+        # stack of every host recon saw). In run 20260903T175056Z the
+        # global stack contained nginx (from an unrelated sub) so the
+        # LLM composed `-tags cve,nginx` against a cPanel host that
+        # doesn't run nginx — 900s wasted, 0 findings.
+        # Precedence:
+        #   1. tech list of the host that matches `host`
+        #   2. global detected_techs (fallback if no per-host tech known)
+        primary_host = urlparse(host).hostname or ""
+        host_techs: list[str] = []
+        for h in (state.get("live_hosts") or []):
+            if str(h.get("host", "")).split(":", 1)[0] == primary_host:
+                host_techs = [str(t).lower() for t in
+                              (h.get("tech") or h.get("technologies") or [])]
+                break
+        if host_techs:
+            techs = sorted(set(host_techs))[:8]
+        else:
+            techs = state.get("detected_techs", [])[:8]
 
         # Extract endpoints with GET params from content_discovery
         param_urls = _extract_param_endpoints(state, limit=8)

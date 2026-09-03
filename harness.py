@@ -1043,6 +1043,57 @@ _TARGET_WILDCARD_RE = __import__("re").compile(
     __import__("re").IGNORECASE)
 
 
+def _hostname_of(target: str) -> str | None:
+    """Extract the hostname of a target string.
+
+    Supports:
+      - Full URL:            https://target.com/path → 'target.com'
+      - Bare host:           target.com:8080          → 'target.com'
+      - IPv4:                192.168.1.1              → '192.168.1.1'
+      - Free text with URL:  'recon https://x.com …'  → 'x.com'
+      - Free text w/o host:  'find bugs'              → None
+
+    Returns None when no plausible hostname can be extracted (natural
+    language objective without any URL/host token).
+    """
+    import re as _re
+    from urllib.parse import urlparse as _urlparse
+    if not target:
+        return None
+    t = target.strip()
+    # Try URL parse directly first
+    if t.startswith(("http://", "https://")):
+        try:
+            h = _urlparse(t).hostname
+            if h:
+                return h
+        except Exception:
+            pass
+    # Look for a URL substring in a free-text objective
+    m = _re.search(r"https?://[a-z0-9.\-_%/:]+", t, _re.IGNORECASE)
+    if m:
+        try:
+            h = _urlparse(m.group(0)).hostname
+            if h:
+                return h
+        except Exception:
+            pass
+    # Bare host with TLD (e.g. `target.com`, `api.target.com:8080`)
+    m = _re.match(
+        r"^([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)+)(?::\d+)?(?:/.*)?$",
+        t, _re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    # Bare IPv4
+    m = _re.match(r"^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?", t)
+    if m:
+        return m.group(1)
+    # localhost / IPv6
+    if t.lower() in ("localhost", "127.0.0.1", "::1"):
+        return t.lower()
+    return None
+
+
 def _looks_like_target(line: str) -> bool:
     """True if `line` looks like a scannable target OR a natural-language
     objective. Rejects short garbage strings like 'by', 'foo', 'abc'.
@@ -1326,9 +1377,32 @@ def _run_orchestrated(cfg: dict, objective: str,
         sessions_root = SESSIONS_DIR
     sessions_root.mkdir(parents=True, exist_ok=True)
 
+    # PP2 fix (2026-09-03): auto-infer in_scope_hosts from the target when
+    # --scope is not given. Before this, state.in_scope_hosts landed as []
+    # (empty) whenever the operator invoked `python harness.py` and pasted
+    # a URL at the REPL without --scope. Empty in_scope removes the
+    # multi-host guardrail — sub_prioritizer would then promote any sub
+    # (cpanel, webmail, 3rd-party CDN) into the scan queue with zero
+    # constraint. Auto-inferring the hostname preserves the intent:
+    # "if you named a target as URL, that target's hostname is your
+    # implicit scope."
+    #
+    # Only applied when --scope AND scope.txt both provide nothing
+    # meaningful. Multi-word natural-language objectives that don't parse
+    # to a hostname keep an empty inferred scope (falls through to
+    # scope.txt's ScopeChecker as before).
+    effective_in_scope = list(scope_override) if scope_override else []
+    if not effective_in_scope:
+        inferred = _hostname_of(objective)
+        if inferred:
+            effective_in_scope = [inferred]
+            print(f"[+] No --scope given; inferred in_scope_hosts from "
+                  f"target: [{inferred}]. Pass --scope explicitly if you "
+                  f"need wildcards or additional patterns.")
+
     orch = Orchestrator(cfg=cfg, tool_registry=tool_registry,
                         target=objective,
-                        in_scope=scope_override or None,
+                        in_scope=effective_in_scope or None,
                         sessions_root=sessions_root,
                         telegram_chat_id=telegram_chat_id,
                         skip_preflight=skip_preflight,

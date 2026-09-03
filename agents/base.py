@@ -160,7 +160,21 @@ def _headers_reminder(custom_headers: dict[str, str]) -> str:
     lines.append("")
     lines.append("If you skip these headers the target's security team may")
     lines.append("mark your traffic as unauthorized. NEVER omit them.")
+    lines.append("═══════════════════════════════════════════════════════════════")
+    lines.append("")
     return "\n".join(lines)
+
+
+def _headers_objective_reminder(custom_headers: dict[str, str]) -> str:
+    """One-liner reminder appended to the user objective. Guarantees the
+    header requirement stays in EVERY turn's context window (system
+    prompt is cached; user objective isn't). Empty when no custom_headers."""
+    if not custom_headers:
+        return ""
+    hdrs = "; ".join(f"{n}: {v}" for n, v in custom_headers.items())
+    return (f"\n\n📌 REMINDER — MANDATORY headers on every HTTP shell "
+            f"command (see system prompt for per-tool flag syntax):  "
+            f"{hdrs}")
 
 
 FINISH_FORMAT_REMINDER = """
@@ -400,15 +414,27 @@ class BaseAgent:
             quick_reminder = QUICK_MODE_REMINDER
             # Halve turns budget to force the model to hurry
             max_iterations_run = max(3, self.MAX_ITERATIONS // 2)
+        # N10 fix (2026-09-03): put the CUSTOM HEADERS reminder FIRST in
+        # the system content, not last. In run 20260903T175056Z the LLM
+        # skipped the X-Grayback attribution header on 20/20 HTTP calls
+        # even though `_headers_reminder` correctly injected the block —
+        # the reminder was at the end of a very long prompt (agent-specific
+        # SYSTEM_PROMPT + FINISH_FORMAT_REMINDER first, headers last) so
+        # the model prioritized the agent workflow and forgot the flag.
+        # Putting the header block up-front (with an ALL-CAPS banner) fixes
+        # it. Also duplicated in the user objective as a one-liner
+        # reminder so it appears in EVERY turn's context window.
         messages = [
             {"role": "system",
-             "content": (self.SYSTEM_PROMPT
+             "content": (headers_reminder
+                         + self.SYSTEM_PROMPT
                          + FINISH_FORMAT_REMINDER
-                         + headers_reminder
                          + ext_tools_hint
                          + ext_techniques_block
                          + quick_reminder)},
-            {"role": "user", "content": objective},
+            {"role": "user", "content": objective
+                             + _headers_objective_reminder(
+                                 self.tool_registry.custom_headers)},
         ]
         tools = self._filtered_tool_schemas()
         transcript: list[dict] = []
