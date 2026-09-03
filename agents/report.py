@@ -404,6 +404,22 @@ class ReportAgent(BaseAgent):
                     f"Rewrite the offending agent's workflow to use "
                     f"`; and `>` in place of `&&`/`&`, and split subshell "
                     f"substitutions across two shell calls.")
+            # (f) wpscan missing but WordPress detected — the WordPress
+            # agent cannot enumerate plugin versions without wpscan, so
+            # 0 CVE match on a WP target is expected but not desirable.
+            # Detected by wordpress.after_run when it sees exit=127 or
+            # `command -v wpscan` returning exit=1.
+            if (s.get("wpscan_missing")
+                and any("wordpress" in t for t in _techs)):
+                _meta_warnings.append(
+                    "**`wpscan` is not installed** on this host but "
+                    "WordPress was detected on the target. Without wpscan "
+                    "the WordPress agent falls back to nuclei alone — no "
+                    "plugin-version enumeration → 0 CVE match on the plugins "
+                    "that fingerprint identified. Install with "
+                    "`gem install wpscan` (macOS: `brew install ruby && "
+                    "gem install wpscan`) and re-run for meaningful WP "
+                    "coverage.")
         except Exception:
             pass  # meta-check NEVER breaks the report
 
