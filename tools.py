@@ -594,21 +594,38 @@ class ToolRegistry:
                 f"Body ({len(r.text)} bytes total, first 4KB shown):\n"
                 f"{body_preview}")
 
+    def maybe_inject_headers(self, command: str) -> tuple[str, str]:
+        """Return (new_command, note). If custom_headers apply to any
+        stage of `command` and the header is not already present, insert
+        the flag with the tool's specific syntax and return the modified
+        command + a one-line note describing what was added. Otherwise
+        return the input untouched with an empty note.
+
+        Exposed as a public method so `BaseAgent._record_tool_activity`
+        can log the FINAL command bash actually ran, not the LLM's
+        original (N10 visibility fix, 2026-09-04). The injection itself
+        was already implemented in `_shell` in the previous iteration —
+        this method centralises it and returns a machine-readable diff."""
+        if not self.custom_headers:
+            return command, ""
+        new_cmd = _inject_headers_into_command(command, self.custom_headers)
+        if new_cmd == command:
+            return command, ""
+        # Diff: everything appended (naive — the injector always appends
+        # at the end of each modified stage). Keep it short for the log.
+        note = ("[harness-inject] added header(s): "
+                + ", ".join(f'{n}: {v}' for n, v in
+                            self.custom_headers.items()))
+        return new_cmd, note
+
     def _shell(self, command: str) -> str:
         if not command or not command.strip():
             return "ERROR: empty command"
 
-        # N10/PN1 fix (2026-09-04): auto-inject custom_headers into
-        # HTTP-aware tool invocations BEFORE validation. The LLM has
-        # forgotten the -H flag on 20/20 tool calls across 4 iterations
-        # despite ALL-CAPS banners at the top of the prompt + one-liner
-        # reminders in every objective. This is a plumbing fix: the
-        # shell tool intercepts every stage's first token and, if it is
-        # `curl`/`nuclei`/`wpscan`/`httpx`/`ffuf`/`nikto`/`feroxbuster`/
-        # `sqlmap`/`dalfox`/`katana`/`hakrawler` and the header is NOT
-        # already present, adds the flag with the tool's specific syntax
-        # (curl-family → `-H`, wpscan → `--headers`, sqlmap → `--headers=`).
-        # Zero dependency on the LLM.
+        # Header injection is now performed BEFORE dispatch (see
+        # `maybe_inject_headers` and BaseAgent._process_tool_call).
+        # Kept as safety net for callers that reach `_shell` directly
+        # without going through the agent loop (rare).
         if self.custom_headers:
             command = _inject_headers_into_command(command,
                                                     self.custom_headers)

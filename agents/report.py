@@ -473,6 +473,25 @@ class ReportAgent(BaseAgent):
                     "run, drop repeated wpscan calls (see anti-repeat "
                     "guardrail in base.py — one wpscan --enumerate per host "
                     "should suffice).")
+            # (i) PN1 (2026-09-04): wpscan exit=4 while WordPress was
+            # detected by nuclei. Almost always a WAF (Cloudflare /
+            # DataDome / Sucuri) blocking wpscan's request signature.
+            if (s.get("wpscan_waf_suspect")
+                and any("wordpress" in t for t in _techs)):
+                _meta_warnings.append(
+                    "**wpscan reported the target as 'not a WordPress "
+                    "site' (exit=4) while nuclei-wordpress-detect "
+                    "confirmed it IS WordPress.** This is almost always "
+                    "a WAF (Cloudflare / DataDome / Sucuri) fingerprinting "
+                    "wpscan's TLS/JA3 or User-Agent and returning a "
+                    "challenge page. Try (in order): (a) verify the "
+                    "attribution header made it through — the harness "
+                    "auto-injects `custom_headers` on wpscan via "
+                    "`--headers`; (b) run wpscan manually with "
+                    "`--verbose --debug --user-agent 'Mozilla/5.0 …'` "
+                    "and inspect the first response; (c) use a browser-"
+                    "fingerprint impersonator such as `curl-impersonate` "
+                    "for the initial WP-existence probe.")
             # (h) Shodan Pro credits exhausted (paid plan monthly limit).
             # ToolRegistry marks state.shodan_pro_exhausted=True on 402 or
             # any 'credits' marker; subsequent shodan_search calls this

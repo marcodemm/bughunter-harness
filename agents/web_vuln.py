@@ -65,6 +65,25 @@ the actual detected_techs (max 3 combined).
      nextjs, keycloak, minio, elasticsearch, kibana, airflow, dokploy,
      coolify, portainer, n8n.
      NEVER: `-tags cve` alone (times out). ALWAYS combine with a product tag.
+
+     PN9 fix (2026-09-04): DO NOT combine `cve` with any of these techs
+     — they have essentially no server-side CVE templates in
+     nuclei-templates and every scan against them wastes ~90s of budget
+     for guaranteed 0 findings:
+       cloudflare · akamai · fastly · cloudfront          (edge CDNs)
+       google-tag-manager · google-analytics · hotjar
+       segment · facebook-pixel                            (trackers)
+       font-awesome · bootstrap · jquery-migrate
+       fitvids.js · easy-pie-chart · hsts                  (frontend libs)
+     Same rule for detected WP plugins — nuclei only ships templates for
+     ~30 of the top WP plugins. Small plugins like `author-box-for-divi`,
+     `social-divi`, `brave-popup-builder`, `gdpr-cookie-compliance`,
+     `table-of-contents-plus` are NOT in the template library — running
+     `-tags cve,<small-plugin>` is a guaranteed zero-hit. Skip them.
+     Prefer wpscan --enumerate for those (WPScan Vulnerability DB is the
+     authoritative source for plugin CVEs). Only combine `cve,<tag>`
+     when <tag> is a well-known server product name (wordpress, php,
+     nginx, apache, jenkins, gitlab, grafana, etc.).
      Common product tags nuclei supports:
        wordpress, joomla, drupal, magento, adminer, phpmyadmin, grafana,
        jenkins, gitlab, jira, confluence, nginx, apache, iis, tomcat,

@@ -516,6 +516,24 @@ class BaseAgent:
                                          self.turns, self.tool_calls)
                     return "done"
 
+                # N10-visibility fix (2026-09-04): if this is a run_shell
+                # call and the registry has custom_headers, apply the
+                # header injection HERE (before dispatch AND before the
+                # activity log) so the log shows the actual command bash
+                # runs, not the LLM's pre-injection version. Also emit
+                # a one-line "[harness-inject]" log entry so the report
+                # transparently attributes the added flag to the harness.
+                if name == "run_shell":
+                    try:
+                        new_cmd, note = \
+                            self.tool_registry.maybe_inject_headers(
+                                args.get("command", ""))
+                        if note:
+                            args["command"] = new_cmd
+                            state.log(self.NAME, "harness-inject", note)
+                    except AttributeError:
+                        pass  # older ToolRegistry — nothing to do
+
                 self.tool_calls += 1
                 result = self.tool_registry.dispatch(name, args)
                 red = redact(result)
@@ -605,7 +623,14 @@ class BaseAgent:
         elif tool == "run_shell":
             # B9 cosmetic: 200 chars con elipsis explicita (antes 120 sin marca)
             raw_cmd = str(args.get("command", ""))
-            cmd = raw_cmd[:200] + ("…" if len(raw_cmd) > 200 else "")
+            # PN1-visibility fix (2026-09-04): expand log budget for
+            # wpscan/nuclei calls so operator can diagnose exit!=0
+            # without re-running. Especially wpscan exit=4 with a
+            # truncated line is opaque; add up to 400 chars of stderr
+            # excerpt after the exit code.
+            _is_diag_tool = any(t in raw_cmd for t in ("wpscan", "nuclei"))
+            _max_cmd = 400 if _is_diag_tool else 200
+            cmd = raw_cmd[:_max_cmd] + ("…" if len(raw_cmd) > _max_cmd else "")
             # B3 fix (2026-09-03): buscar exit=<N> en TODO el output con
             # regex. Además: reclassify SIGPIPE benignos (N11):
             #   exit=141 (128+SIGPIPE) → cat/head/tail piped
@@ -632,8 +657,31 @@ class BaseAgent:
                 status_note = result.splitlines()[0][:120]
             else:
                 status_note = ""
+            # PN1-visibility (2026-09-04): for wpscan/nuclei with
+            # exit != 0, append a stderr excerpt to the log so the
+            # operator can see WHY without re-running. Also flip a
+            # session flag `wpscan_waf_suspect` when wpscan exits 4
+            # while wordpress is detected — meta-check will surface it.
+            stderr_excerpt = ""
+            if _is_diag_tool and status_note and status_note.startswith("exit="):
+                try:
+                    exit_num = int(status_note.split("=", 1)[1].split()[0])
+                except (ValueError, IndexError):
+                    exit_num = 0
+                if exit_num != 0:
+                    # Extract the stderr block from the harness _shell wrapper
+                    err_idx = result.find("--- stderr")
+                    if err_idx >= 0:
+                        # Take the 400 chars after the stderr marker
+                        after = result[err_idx:err_idx + 500]
+                        # Strip the marker line + collapse whitespace
+                        after_lines = after.splitlines()[1:6]
+                        stderr_excerpt = " · stderr: " + " ".join(
+                            l.strip() for l in after_lines if l.strip())[:400]
+                    if "wpscan" in raw_cmd and exit_num == 4:
+                        state.set("wpscan_waf_suspect", True)
             state.log(self.NAME, "shell",
-                      f"{cmd} → {status_note[:150] or '(no exit)'}")
+                      f"{cmd} → {status_note[:120] or '(no exit)'}{stderr_excerpt}")
         elif tool == "oob_generate_token":
             state.log(self.NAME, "oob",
                       f"generated token for {args.get('vector', '?')}"

@@ -172,6 +172,17 @@ Rules:
                 cleaned = _normalize_and_dedup_techs(techs)
                 state.extend("detected_techs", cleaned)
 
+        # PN8 fix (2026-09-04): httpx is NOT NEGOTIABLE for the recon
+        # agent. In run 20260903T223821Z the LLM burned its 5 turns on
+        # subfinder / dnsx / sort / cat and never ran httpx — the pipe
+        # ended with `## Live Hosts (1)` containing only the URL, no
+        # status/title/tech, which cascaded to sub_prioritizer skipping
+        # (1 live host) and downstream agents losing tech context.
+        # If no httpx call was seen in the transcript, run it here in
+        # Python against the resolved subs list. Populates live_hosts
+        # with full status/title/tech-detect JSON records.
+        self._ensure_httpx_ran(state, transcript, subs)
+
         # Shodan InternetDB enrichment (2026-09-03): populate each
         # live_host with passive intel (ports/CVEs/tags/vulns/hostnames)
         # from Shodan's free InternetDB. Zero cost (no key, no throttle),
@@ -207,6 +218,115 @@ Rules:
             except Exception:
                 pass
 
+
+    def _ensure_httpx_ran(self, state, transcript, subs_seen: set) -> None:
+        """PN8 fix (2026-09-04): if the LLM's recon transcript contains
+        no httpx invocation, run httpx from Python against the resolved
+        subs list. Populates state.live_hosts with the same rich
+        status/title/tech-detect records the LLM's own httpx would
+        produce. If httpx is not installed on this host, this is a no-op
+        and the earlier fallback (add target as synthetic live_host)
+        still applies."""
+        import shutil
+        import subprocess
+        # Did the LLM already run httpx?
+        for entry in transcript:
+            cmd = str(entry.get("args", {}).get("command", "")).lower()
+            if entry.get("tool") == "run_shell" and "httpx" in cmd:
+                return  # already ran — nothing to do
+        # httpx binary available?
+        httpx_bin = shutil.which("httpx")
+        if not httpx_bin:
+            state.log(self.NAME, "warn",
+                      "httpx not installed (`brew install httpx`) — "
+                      "live_hosts will only carry URL + fallback status")
+            return
+
+        # Build a candidate host list: prefer the subs subfinder found;
+        # else fall back to the resolved target hostname.
+        candidates = sorted(subs_seen) if subs_seen else []
+        if not candidates:
+            try:
+                p = urlparse(state.get("target") or "")
+                if p.hostname:
+                    candidates = [p.hostname]
+            except Exception:
+                pass
+        if not candidates:
+            return
+
+        # Write candidates to a temp file for httpx -l
+        import tempfile
+        from pathlib import Path as _P
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", delete=False,
+                    prefix="harness-recon-httpx-", suffix=".txt") as f:
+                f.write("\n".join(candidates))
+                tmpfile = f.name
+        except Exception as e:
+            state.log(self.NAME, "warn",
+                      f"httpx fallback: temp file creation failed: {e}")
+            return
+
+        # Attribution headers: reuse ToolRegistry.custom_headers if the
+        # orchestrator wired one. We don't have direct access from the
+        # agent — thread through cfg.custom_headers instead.
+        extra_hdrs = []
+        for name, value in (self.cfg.get("custom_headers") or {}).items():
+            if name and value:
+                extra_hdrs.extend(["-H", f"{name}: {value}"])
+
+        cmd = [httpx_bin, "-l", tmpfile, "-silent", "-status-code",
+                "-title", "-tech-detect", "-json",
+                "-timeout", "10", "-retries", "1", "-rl", "20"] + extra_hdrs
+        state.log(self.NAME, "info",
+                   f"httpx fallback: running Python-side against "
+                   f"{len(candidates)} candidate(s)")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=180)
+        except subprocess.TimeoutExpired:
+            state.log(self.NAME, "warn",
+                       "httpx fallback: 180s timeout — partial or empty")
+            return
+        except Exception as e:
+            state.log(self.NAME, "warn",
+                       f"httpx fallback failed: {type(e).__name__}: {e}")
+            return
+        finally:
+            try:
+                _P(tmpfile).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Parse JSON output — same schema recon uses via LLM
+        import json as _j
+        added = 0
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = _j.loads(line)
+            except Exception:
+                continue
+            live = state.get("live_hosts") or []
+            _append_httpx_record(live, rec)
+            state.set("live_hosts", live)
+            added += 1
+        if added:
+            state.log(self.NAME, "info",
+                       f"httpx fallback: added {added} live_host record(s) "
+                       f"with status/title/tech-detect")
+            # Propagate tech hints to detected_techs
+            techs: set[str] = set()
+            for h in (state.get("live_hosts") or []):
+                for t in (h.get("tech") or []):
+                    techs.add(str(t).lower())
+            if techs:
+                merged = sorted(set(state.get("detected_techs") or []) | techs)
+                state.set("detected_techs", merged)
 
     def _enrich_with_shodan_internetdb(self, state) -> None:
         """For each live_host, resolve to an IP and hit Shodan InternetDB
