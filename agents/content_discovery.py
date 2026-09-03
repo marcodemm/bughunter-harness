@@ -34,9 +34,14 @@ Workflow (one tool_call per turn):
   4. ffuf -u <target-url>/FUZZ -w <wordlist> -mc all -rate 10 -o /tmp/f.txt
      — with cookie, add: -H "Cookie: <cookie>"
      — Wordlists to try in this order (use `ls` first if unsure):
+        ../wordlists/quick-500.txt              ← DEFAULT (top-500, ~10× faster)
         /opt/homebrew/share/seclists/Discovery/Web-Content/common.txt
         /opt/homebrew/share/seclists/Discovery/Web-Content/raft-small-words.txt
         /usr/share/seclists/Discovery/Web-Content/common.txt
+     — quick-500.txt lives INSIDE this harness (wordlists/quick-500.txt);
+       resolve its absolute path from the harness root. It contains the
+       500 most popular paths from raft-small-words-lowercase.txt and is
+       ~10× faster than common.txt (4.7k) with ~90% of the discovery.
   5. finish() with count of unique paths discovered on THE TARGET
 
 Rules:

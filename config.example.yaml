@@ -160,7 +160,9 @@ adversarial_review:
 multi_host:
   enabled: false               # default off (single-host = fastest single-run)
                                # — auto-flipped to ON if scope has *.<domain>
-  top_n: 3                     # scan top-3 prioritized subs
+  top_n: 1                     # scan top-1 prioritized sub only
+                               # — raise to 3-5 for wider coverage at 3-5× the wall-clock;
+                               # CLI --top-hosts N overrides per run.
   min_score: 30                # only include subs with score >= 30
                                # (falls back to top_n if nothing meets it)
   # Agents that run ONCE PER SUB in the loop. `recon` and `sub_prioritizer`
