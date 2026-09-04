@@ -22,6 +22,11 @@ SHELL_ALLOWLIST = {
     "httpx", "subfinder", "dnsx", "naabu", "gau", "waybackurls", "katana",
     # Active parameter scanners
     "sqlmap", "dalfox",
+    # Iter 14 (2026-09-04): visual/OSINT extension binaries invoked by
+    # the deterministic `screenshot` + `typosquat` extension agents.
+    # Guarded by state.missing_tools — the agents skip themselves when
+    # the binary isn't installed, so allowlisting them is safe.
+    "gowitness", "dnstwist",
 }
 
 # Coreutils/helpers commonly used as later pipeline stages, or standalone

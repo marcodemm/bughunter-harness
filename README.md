@@ -524,6 +524,63 @@ The final REPORT.md's `⚠️ Meta-check warnings` block explains it happened an
 
 ---
 
+## Visual triage + typosquat OSINT (deterministic extensions)
+
+Two extension agents ship in `extensions/agents/` — both **deterministic** (no LLM turns, no reasoning; the tool does the work) and both **self-skipping** when the underlying binary isn't installed (the startup pre-check publishes them to `state.missing_tools` and the agent's `entry_condition` reads that).
+
+### `screenshot` — `gowitness` per live host
+
+Runs `gowitness` against every host in `state.live_hosts` right after `content_discovery`. Produces a PNG per host + a browsable HTML gallery under `<run_dir>/screenshots/`. The rendered REPORT.md gets a `## Screenshots (N/M captured)` block linking the directory and gallery, plus a per-host list of PNG paths — visual triage of 100+ hosts in one browser tab instead of opening each URL manually.
+
+Install:
+```bash
+go install github.com/sensepost/gowitness@latest
+```
+
+Config (`config.yaml → screenshot.*`, all fields optional):
+```yaml
+screenshot:
+  enabled: true                    # opt-out
+  max_hosts: 50                    # cap the shoot (default 50)
+  timeout_per_host_sec: 15
+  resolution: "1440,900"
+```
+
+### `typosquat` — `dnstwist` against the target's apex
+
+Runs `dnstwist --registered --format json` against the apex domain right after `recon`. Enumerates permutations (bit-flips, character-omissions, typo-additions, homoglyphs, TLD-swaps) that are ACTUALLY REGISTERED and resolve today. REPORT.md gets a `## Typosquat / phishing candidates` table with the domain, fuzzer type, A records, MX and whois creation date.
+
+Two use-cases in bug bounty:
+- **Phishing intel** — a registered `d0main.com` for a target whose real apex is `domain.com` is a phishing candidate. Some programs (fintech, healthcare) accept these as Low/Medium reports.
+- **Takeover pivots** — an EXPIRED-then-parked lookalike whose CNAME points to unclaimed 3rd-party service is a subdomain-takeover primitive on a sibling.
+
+Install:
+```bash
+brew install pipx
+pipx install dnstwist
+```
+
+Config (`config.yaml → typosquat.*`, all fields optional):
+```yaml
+typosquat:
+  enabled: true
+  timeout_sec: 300                 # dnstwist is slow over the wire
+  max_permutations: 200
+  include_unregistered: false      # true = also list domains that
+                                    # don't resolve (huge output)
+```
+
+### If the binary is missing
+
+The startup banner already tells you:
+```
+[+] Optional tools NOT installed (agents will be told to skip): gowitness, dnstwist, ...
+```
+
+Both agents check `state.missing_tools` in their `entry_condition` and mark themselves `skipped` with reason `"gowitness not installed"` / `"dnstwist not installed"`. No error, no wasted turn, and the rest of the pipeline runs as usual.
+
+---
+
 ## Extending — drop-in agents / tools / techniques
 
 Bughunter Harness ships with a three-slot extension framework. Drop a file into `extensions/`, restart the harness, and it is live. No core changes, no plugin registration, no rebuild.
