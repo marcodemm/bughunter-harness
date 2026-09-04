@@ -322,6 +322,14 @@ class Orchestrator:
             "subjack", "subzy", "naabu", "amass", "hakrawler", "unfurl",
             "gospider", "meg", "gowitness", "eyewitness",
             "dnstwist", "assetfinder", "chaos-client",
+            # PN22 iter 13 (2026-09-04): curl-impersonate is the
+            # recommended remediation for wpscan_waf_suspect (fingerprint
+            # a browser TLS/JA3 so WAFs like ModSecurity CRS, Cloudflare,
+            # DataDome don't block the initial WP-existence probe). The
+            # meta-check warning in report.py points at it explicitly;
+            # detecting it here lets the WAF-suspect warning tell the
+            # operator whether they already have the tool installed.
+            "curl_chrome116", "curl-impersonate", "curl-impersonate-chrome",
         ]
         missing: list[str] = []
         for bin_name in _OPTIONAL:

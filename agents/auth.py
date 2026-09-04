@@ -107,6 +107,21 @@ Rules:
                         title=f"auth/{m.group(1)} on {m.group(3)}",
                         evidence=m.group(0),
                         recommendation="Verify manually and report")
+                # PN21 iter 13 (2026-09-04): parse WordPress-specific
+                # unauth-info endpoints that the LLM commonly probes but
+                # doesn't always promote to a finding via its finish()
+                # narrative. Regression trigger: run 20260904T181945Z ran
+                # `curl -s .../wp-json/wp/v2/users` (exit=0, 200 body)
+                # and 14 other tool calls over 44 min, but the auth agent
+                # after_run parser had no branch for it → 0 findings, 0
+                # narrative. A prior run against a different WordPress target got the finding only
+                # because the LLM happened to remember to call add_finding
+                # from its finish() summary; not a robust guarantee.
+                _wp_user_enum(state, self.NAME, entry, result)
+            # http_get with the SAME endpoint — the harness's native tool
+            # also produces a body that we can parse deterministically.
+            if entry.get("tool") == "http_get":
+                _wp_user_enum(state, self.NAME, entry, result)
 
             # Auto-detect: admin-like path returning 200 without auth challenge.
             # Guarded against SPA false positives (Next.js/React/Vue apps that
@@ -191,6 +206,85 @@ Rules:
                             evidence=result[:400],
                             recommendation=("Verify manually whether real "
                                             "admin data is exposed."))
+
+
+def _wp_user_enum(state, agent_name: str, entry: dict, result: str) -> None:
+    """PN21 iter 13 (2026-09-04): parse WordPress unauth-user-enumeration
+    signals from a shell/http_get result and emit a finding when the
+    output shows the classic REST-API JSON array of users.
+
+    Fired by both `run_shell` (curl) and `http_get` branches — either
+    tool the LLM chose to hit `/wp-json/wp/v2/users` (or `/users/<id>`,
+    or `/?author=1`) leaves a signature in the response body that we
+    can detect independently of the LLM narrative summary.
+
+    Idempotent — checks `state.findings` for a pre-existing finding
+    with the same title before adding (LLM's finish() may already have
+    emitted it)."""
+    if not result:
+        return
+    cmd = str(entry.get("args", {}).get("command", ""))
+    url_arg = str(entry.get("args", {}).get("url", ""))
+    signature = (cmd + " " + url_arg).lower()
+    if "/wp-json/wp/v2/users" not in signature and \
+       "/?author=" not in signature:
+        return
+    body_low = result.lower()
+    # Signature 1: JSON array response `[{"id":<n>,"slug":"…"}]` — WP
+    # REST returns this for /wp-json/wp/v2/users when unauth-readable.
+    import re as _re
+    users: list[dict] = []
+    m = _re.search(r"\[\s*\{[^\[\]]{0,200}?\"id\"\s*:\s*\d+", result)
+    if m:
+        for u in _re.finditer(r'"id"\s*:\s*(\d+)[^{}]*?'
+                               r'"slug"\s*:\s*"([^"]+)"[^{}]*?'
+                               r'(?:"name"\s*:\s*"([^"]*)")?', result):
+            users.append({
+                "id": u.group(1),
+                "slug": u.group(2),
+                "name": u.group(3) or "",
+            })
+    # Signature 2: /?author=<N> → Location redirect leaking the slug in
+    # the wp-json canonical URL.
+    if not users and "/?author=" in signature:
+        m2 = _re.search(r"location:\s*https?://[^/]+/author/([^/\s]+)/?",
+                         result, _re.IGNORECASE)
+        if m2:
+            users.append({"id": "?", "slug": m2.group(1), "name": ""})
+    if not users:
+        return
+    # Extract target host from url_arg or cmd
+    _url = _re.search(r"https?://[^\s\"'<>]+", url_arg + " " + cmd)
+    target = _url.group(0) if _url else _primary_url(state)
+    slugs = ", ".join(u["slug"] for u in users[:5])
+    more = f" +{len(users)-5} more" if len(users) > 5 else ""
+    title = (f"WordPress REST API information disclosure: "
+              f"/wp-json/wp/v2/users publicly readable ({len(users)} "
+              f"user(s) exposed: {slugs}{more})")
+    # Idempotent — skip if already emitted (LLM's finish() may have)
+    existing = state.get("findings", []) or []
+    for f in existing:
+        if "wp-json/wp/v2/users publicly readable" in str(
+                f.get("title", "")).lower():
+            return
+    state.add_finding(
+        agent=agent_name, severity="info",
+        title=title[:200],
+        evidence=(f"{target} → {len(users)} user record(s). Slugs: "
+                   f"{slugs}{more}. Full response snippet: "
+                   f"{result[:400].strip()}"),
+        recommendation=(
+            "WordPress exposes the users array on `/wp-json/wp/v2/users` "
+            "and via `/?author=<id>` redirects by default. Impact on its "
+            "own is Info — but each slug is a valid login username, so "
+            "the endpoint hands attackers a user list for follow-on "
+            "brute-force / password-spray against wp-login.php or the "
+            "XML-RPC endpoint. Mitigation: filter `rest_endpoints` for "
+            "the `wp/v2/users` route (disable unauth access) OR install "
+            "a security plugin (Wordfence, iThemes) that blocks the "
+            "endpoint by default. Also disable pretty-permalink author "
+            "redirects if not used."),
+    )
 
 
 def _primary_url(state):

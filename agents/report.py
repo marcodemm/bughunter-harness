@@ -583,8 +583,22 @@ class ReportAgent(BaseAgent):
             # sanity-checked as `wordpress:7.0.4` — otherwise the check
             # never fires on nuclei-detector-named techs.
             from tech_aliases import resolve_tech_alias
+            # PN17 completion iter 13 (2026-09-04): the sanity check
+            # used to iterate only `state.detected_techs` (which lands
+            # in kebab-case, deduped, sometimes without version). The
+            # richer version-tagged tech strings (e.g. `WordPress:7.1`,
+            # `Yoast SEO:28.4`) live in `live_hosts[i].tech` in display
+            # form — populated by recon's httpx `-tech-detect` fallback.
+            # Extending the check to also walk live_hosts.tech means an
+            # implausible version like `WordPress:999.9` fires the
+            # warning regardless of which source produced it.
+            _live_techs = []
+            for h in (s.get("live_hosts") or []):
+                for t in (h.get("tech") or []):
+                    _live_techs.append(str(t).lower())
+            _all_techs = _techs + _live_techs
             _implausible: list[str] = []
-            for t in _techs:
+            for t in _all_techs:
                 t = resolve_tech_alias(t)
                 if ":" not in t:
                     continue
@@ -599,6 +613,9 @@ class ReportAgent(BaseAgent):
                 if not (_tech_ver(lo) <= v <= _tech_ver(hi)):
                     _implausible.append(f"`{name}:{ver}` (plausible range: "
                                          f"{lo} — {hi})")
+            # Dedup — same (name:ver) can arrive twice, once from
+            # detected_techs and once from live_hosts.tech.
+            _implausible = sorted(set(_implausible))
             if _implausible:
                 _meta_warnings.append(
                     "**Implausible tech version(s) detected**: "
@@ -630,7 +647,8 @@ class ReportAgent(BaseAgent):
                     "`--verbose --debug --user-agent 'Mozilla/5.0 …'` "
                     "and inspect the first response; (c) use a browser-"
                     "fingerprint impersonator such as `curl-impersonate` "
-                    "for the initial WP-existence probe.")
+                    "for the initial WP-existence probe."
+                    + _curl_impersonate_hint(s))
             # (h) Shodan Pro credits exhausted (paid plan monthly limit).
             # ToolRegistry marks state.shodan_pro_exhausted=True on 402 or
             # any 'credits' marker; subsequent shodan_search calls this
@@ -823,3 +841,27 @@ def _count_unique_cves_in_findings(snapshot: dict) -> int:
                                     _re.IGNORECASE):
                 seen.add(m.group(0).upper())
     return len(seen)
+
+
+def _curl_impersonate_hint(snapshot: dict) -> str:
+    """PN22 iter 13 (2026-09-04): return a one-line hint about
+    curl-impersonate availability, appended to the wpscan-WAF-suspect
+    meta-check warning. Reads `state.missing_tools` published by
+    orchestrator._precheck_optional_tools() to tell the operator
+    whether the tool is installed (recommend running it manually)
+    or missing (give the install pointer)."""
+    missing = snapshot.get("missing_tools") or []
+    missing_low = [str(m).lower() for m in missing]
+    variants = ("curl-impersonate", "curl_chrome116",
+                "curl-impersonate-chrome")
+    installed = not any(v in missing_low for v in variants)
+    if installed:
+        return (" `curl-impersonate` is installed on this host — try "
+                "`curl_chrome116 -sI <target>/wp-login.php` manually "
+                "to confirm the WAF blocks wpscan's fingerprint but not "
+                "a real Chrome one.")
+    return (" `curl-impersonate` is NOT installed — the recommended "
+            "way to test the WAF-bypass theory. Install on macOS: "
+            "`brew install curl-impersonate` (installs `curl_chrome116`, "
+            "`curl_ff109`, …). Then: `curl_chrome116 -sI "
+            "<target>/wp-login.php`.")
