@@ -1286,10 +1286,12 @@ def prompt_for_objective(is_first: bool) -> str | None:
             print("\nObjective (one-line goal for the agent). "
                   "Type /quit or /bye to exit.")
             print("Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH")
+            print("Example (CLI): python harness.py --target https://www.dominio.com --scope '*.dominio.com' --top-hosts 5 --complete")
         else:
             print("\n─── Previous session ended ───")
             print("New objective (or /quit / /bye to exit).")
             print("Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH")
+            print("Example (CLI): python harness.py --target https://www.dominio.com --scope '*.dominio.com' --top-hosts 5 --complete")
         line = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n[!] Cancelled.")
@@ -1317,7 +1319,16 @@ def prompt_for_objective(is_first: bool) -> str | None:
     # (3) Validate the stripped input looks like a target or objective
     stripped, _flags = parse_repl_line(line)
     if not stripped:
-        # Only flags were given, no actual target — nothing to scan.
+        # UX iter 8 (2026-09-04): a line that carried AT LEAST ONE
+        # recognised sticky flag is a legitimate "update-a-setting"
+        # command, not an error. Return the line unchanged so run_repl
+        # applies the flag and prints the `[+] X set (sticky): Y`
+        # confirmation, then falls through to `if not objective:
+        # continue` → back to the prompt without exiting. Only when
+        # the input had NO recognised flag either (empty line or all
+        # unknown tokens) do we show the help.
+        if _flags:
+            return line
         print("[!] No target provided (only flags parsed).")
         print(REPL_COMMANDS_HINT)
         return prompt_for_objective(is_first=is_first)
@@ -1790,9 +1801,11 @@ def main():
             session_no_escalate = bool(overrides["no_escalate"])
             print(f"[+] no-escalate {'ON' if session_no_escalate else 'OFF'} (sticky)")
 
-        # 3. If line was just flags (no objective text), re-prompt without exiting
+        # 3. If line was just flags (no objective text), re-prompt without
+        # exiting. UX iter 8 (2026-09-04): the per-flag `[+] X set (sticky):
+        # Y` lines above already confirm what happened; no need for a
+        # scolding "give me an objective" — just loop back quietly.
         if not objective:
-            print("[!] Give me an objective, or /quit to leave.")
             continue
 
         # 4. Run one session — pass merged headers + LLM backend overrides
