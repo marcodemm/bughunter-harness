@@ -235,6 +235,57 @@ class ReportAgent(BaseAgent):
                 lines.append(f"- … and {len(subs) - 100} more")
             lines.append("")
 
+        # PN10 fix (2026-09-04): endpoints probed negative — separate
+        # section from the "confirmed" endpoints_found. Prevents the
+        # operator from opening dead URLs (404/500/000). Lists status
+        # so they can spot patterns (e.g. all 500 = WP DB error).
+        neg = s.get("endpoints_probed_negative") or []
+        if neg:
+            lines.append(f"## Endpoints probed negative "
+                         f"({len(neg)} — status 4xx/5xx/000)")
+            lines.append("")
+            lines.append("These URLs were candidates from the crawl but a "
+                         "HEAD probe returned a non-success status. Not "
+                         "listed as `Endpoints Discovered` above so the "
+                         "operator doesn't waste time opening dead pages. "
+                         "Recurring 500s on the same host trigger a "
+                         "short-circuit (DoS-avoidance).")
+            lines.append("")
+            for e in neg[:40]:
+                st = e.get("status")
+                st_str = f"HTTP {st}" if st else "connect fail (000)"
+                reason = e.get("skipped_reason", "")
+                reason_str = f" · skipped: {reason}" if reason else ""
+                lines.append(f"- `{e.get('url','?')}` — {st_str}{reason_str}")
+            if len(neg) > 40:
+                lines.append(f"- … and {len(neg) - 40} more")
+            lines.append("")
+
+        # PN11 fix (2026-09-04): WordPress plugins brute-forced by wpscan
+        # but with no independent evidence of presence (fingerprint miss
+        # + readme.txt not accessible). Listed here in a dedicated
+        # section so the operator sees them for reference but their CVEs
+        # don't inflate the main findings list with likely FPs.
+        unconfirmed = s.get("wpscan_unconfirmed_plugins") or []
+        if unconfirmed:
+            lines.append(f"## WordPress plugins brute-forced by wpscan "
+                         f"(unconfirmed, {len(unconfirmed)})")
+            lines.append("")
+            lines.append("These plugin slugs came from wpscan's `--plugins-"
+                         "detection aggressive` brute-force but neither the "
+                         "`fingerprint` agent nor a live `/wp-content/plugins/"
+                         "<slug>/readme.txt` probe corroborated their presence. "
+                         "**CVEs of these plugins were NOT emitted as findings** "
+                         "to avoid false positives from WAF/CDN uniform-status "
+                         "responses. Investigate manually if any of these slugs "
+                         "look plausible for this target's stack:")
+            lines.append("")
+            for slug in unconfirmed[:60]:
+                lines.append(f"- `{slug}`")
+            if len(unconfirmed) > 60:
+                lines.append(f"- … and {len(unconfirmed) - 60} more")
+            lines.append("")
+
         # N12 fix (2026-09-03): Shodan InternetDB Enrichment section.
         # Before this, the log line `[shodan] InternetDB enriched N host(s)`
         # was the only visible artifact. Now each host's ports/CVEs/tags
@@ -473,6 +524,59 @@ class ReportAgent(BaseAgent):
                     "run, drop repeated wpscan calls (see anti-repeat "
                     "guardrail in base.py — one wpscan --enumerate per host "
                     "should suffice).")
+            # (j) N6 (2026-09-04): implausible tech version detected in
+            # aggregated tech list or live_hosts. e.g. `WordPress:7.1`
+            # when WP core is 6.x, or `Yoast SEO:28.4` when 22-24 is
+            # current. Warns without blocking — often it's a bad-detect
+            # from httpx tech-detect confusing plugin version with core.
+            _IMPLAUSIBLE_TECH_RANGES = {
+                "wordpress": ("3.0", "6.99"),
+                "drupal": ("6.0", "12.99"),
+                "joomla": ("2.0", "6.99"),
+                "yoast-seo": ("1.0", "25.99"),
+                "yoast seo": ("1.0", "25.99"),
+                "php": ("5.0", "8.99"),
+                "nginx": ("0.7", "1.99"),
+                "apache": ("1.3", "3.99"),
+            }
+            def _tech_ver(t: str) -> tuple:
+                parts = []
+                for p in str(t).replace("-", ".").split(".")[:5]:
+                    try:
+                        parts.append(int("".join(c for c in p if c.isdigit()) or "0"))
+                    except ValueError:
+                        parts.append(0)
+                while len(parts) < 5:
+                    parts.append(0)
+                return tuple(parts)
+            _implausible: list[str] = []
+            for t in _techs:
+                if ":" not in t:
+                    continue
+                name, _, ver = t.partition(":")
+                name = name.strip().lower()
+                ver = ver.strip()
+                rng = _IMPLAUSIBLE_TECH_RANGES.get(name)
+                if not rng or not ver:
+                    continue
+                lo, hi = rng
+                v = _tech_ver(ver)
+                if not (_tech_ver(lo) <= v <= _tech_ver(hi)):
+                    _implausible.append(f"`{name}:{ver}` (plausible range: "
+                                         f"{lo} — {hi})")
+            if _implausible:
+                _meta_warnings.append(
+                    "**Implausible tech version(s) detected**: "
+                    + ", ".join(_implausible[:5])
+                    + (f" (+{len(_implausible)-5} more)"
+                       if len(_implausible) > 5 else "")
+                    + ". Likely a bad-detect from httpx `-tech-detect` "
+                    "confusing a plugin/theme version with the parent "
+                    "product. Verify against `<meta name=\"generator\">` "
+                    "in the page HTML or `curl <base>/readme.html`. "
+                    "Downstream CVE lookups against these versions "
+                    "return zero matches (version doesn't exist)."
+                )
             # (i) PN1 (2026-09-04): wpscan exit=4 while WordPress was
             # detected by nuclei. Almost always a WAF (Cloudflare /
             # DataDome / Sucuri) blocking wpscan's request signature.

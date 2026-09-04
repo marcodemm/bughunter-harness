@@ -34,20 +34,22 @@ already found by the recon agent, detect ones with dangling CNAMEs that
 point to unclaimed third-party services (S3 buckets, GitHub Pages,
 Heroku, Fastly, Netlify, Azure blob, etc.).
 
-Preferred tool: `subjack` (install: `go install github.com/haccer/subjack@latest`).
-Fallback: nuclei's `-tags takeover` template set.
+PN6 fix (2026-09-04): use `nuclei -tags takeover` as the ONLY tool.
+`subjack` was the historical preferred tool but requires `$(go env GOPATH)`
+substitution to locate its fingerprints.json, and `$( )` is on the
+harness command denylist. nuclei-templates ships an equivalent takeover
+template set that covers the same fingerprint database. Simpler and
+works out of the box.
 
-CRITICAL: for the nuclei fallback, ALWAYS include
+CRITICAL: ALWAYS include
       -jsonl -o /tmp/harness-nuclei-takeover.jsonl
-so the harness parses the file (independent of stdout survival through the
-shell wrapper).
+so the harness parses the file (independent of stdout survival through
+the shell wrapper).
 
 Workflow (one tool_call per turn):
-  1. Write subdomains to /tmp/harness-subs.txt (one per line).
-  2. Run either:
-       subjack -w /tmp/harness-subs.txt -t 20 -timeout 30 -ssl -v \
-         -c $(go env GOPATH)/src/github.com/haccer/subjack/fingerprints.json
-     OR (nuclei fallback with JSONL sink for deterministic parsing):
+  1. Write subdomains to /tmp/harness-subs.txt (one per line, `cat > file
+     << 'EOF' … EOF` style — the harness accepts heredocs).
+  2. Run:
        nuclei -l /tmp/harness-subs.txt -tags takeover -silent -rl 5 -c 5 \
          -jsonl -o /tmp/harness-nuclei-takeover.jsonl
   3. finish() with any confirmed takeovers as:

@@ -199,10 +199,75 @@ Rules:
             state.log(self.NAME, "info",
                       f"dropped {dropped_invalid} malformed URLs (regex "
                       f"fragments, LLM narrative text, escape sequences)")
+        # PN10 fix (2026-09-04): HEAD-probe every candidate before
+        # promoting to endpoints_found. `.well-known/*` are RFC 8615
+        # canonical paths content_discovery probes on every target;
+        # verification in-the-wild showed 8/8 of them return 404/500/000
+        # on this class of target. Un-probed endpoints polluted the
+        # REPORT and misled the operator into opening dead URLs. Now:
+        #   endpoints_found          → status 2xx/3xx (real)
+        #   endpoints_probed_negative → status 4xx/5xx/000 (attempted)
+        # Report renders them in two separate sections.
+        confirmed: list[dict] = []
+        negative: list[dict] = []
         if found:
-            state.extend("endpoints_found",
-                         [{"url": u, "via": "content_discovery"}
-                          for u in sorted(found)])
+            try:
+                import requests as _rq
+            except Exception:
+                _rq = None
+            # Attribution headers from cfg
+            _hdrs = {}
+            for name, value in (self.cfg.get("custom_headers") or {}).items():
+                if name and value:
+                    _hdrs[str(name)] = str(value)
+            _hdrs.setdefault("User-Agent",
+                              "Mozilla/5.0 (compatible; bughunter-harness/1)")
+            _seen_5xx: set[str] = set()
+            for u in sorted(found):
+                # Skip repeated 5xx paths on the same host to avoid MySQL
+                # pool exhaust on unstable WP sites — many VDPs prohibit
+                # anything that could hurt availability, so short-circuit
+                # further requests to the same host after the first 5xx.
+                host = _up(u).hostname or ""
+                if host in _seen_5xx:
+                    negative.append({"url": u, "via": "content_discovery",
+                                      "status": None,
+                                      "skipped_reason": "prior 5xx on host"})
+                    continue
+                if _rq is None:
+                    confirmed.append({"url": u, "via": "content_discovery"})
+                    continue
+                try:
+                    r = _rq.head(u, timeout=5, allow_redirects=False,
+                                  verify=False, headers=_hdrs)
+                    status = r.status_code
+                except _rq.RequestException:
+                    status = 0
+                except Exception:
+                    status = 0
+                if 200 <= status < 400:
+                    confirmed.append({"url": u, "via": "content_discovery",
+                                       "status": status})
+                else:
+                    negative.append({"url": u, "via": "content_discovery",
+                                      "status": status})
+                    if 500 <= status < 600:
+                        _seen_5xx.add(host)
+                        state.log(self.NAME, "warn",
+                                   f"{u} → HTTP {status}; short-circuiting "
+                                   f"further probes on {host} to avoid "
+                                   f"DoS-ish load on an unstable service")
+                # Throttle: 0.5 req/s per probe (respects operational rules)
+                import time as _t
+                _t.sleep(0.5)
+        if confirmed:
+            state.extend("endpoints_found", confirmed)
+        if negative:
+            state.extend("endpoints_probed_negative", negative)
+            state.log(self.NAME, "info",
+                       f"HEAD-probe filter: {len(confirmed)} endpoint(s) "
+                       f"confirmed status 2xx/3xx, {len(negative)} probed "
+                       f"negative (4xx/5xx/000) — see REPORT sections")
 
 
 def _first_live_host(state):

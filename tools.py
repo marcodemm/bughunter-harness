@@ -594,6 +594,55 @@ class ToolRegistry:
                 f"Body ({len(r.text)} bytes total, first 4KB shown):\n"
                 f"{body_preview}")
 
+    # PN9 reinforce (2026-09-04): the web_vuln prompt already lists techs
+    # that have no server-side CVE templates in nuclei-templates and asks
+    # the LLM not to combine `cve,<tech>` with them, but in run 20260903T234439Z
+    # the LLM still emitted `-tags cve,cloudflare` and 4 other zero-hit
+    # scans that burnt ~5 min. Backstop at the shell level: intercept any
+    # nuclei call whose -tags includes `cve` combined with a known non-
+    # scannable tech, and short-circuit with a clear ERROR — the LLM sees
+    # the reason and moves on without spending nuclei time.
+    _NUCLEI_NON_SCANNABLE_TAGS = {
+        # CDNs / edge
+        "cloudflare", "akamai", "fastly", "cloudfront",
+        # trackers / analytics
+        "google-tag-manager", "google-analytics", "facebook-pixel",
+        "hotjar", "segment", "mixpanel", "amplitude",
+        # frontend CSS/font libs
+        "font-awesome", "bootstrap", "materialize",
+        # frontend JS libs with no server surface
+        "jquery-migrate", "fitvids.js", "fitvids", "easy-pie-chart",
+        # transport / protocol markers
+        "hsts", "http/3", "http-2", "http-3",
+    }
+
+    def maybe_reject_nuclei_scan(self, command: str) -> str:
+        """Return an ERROR reason string if this command is a `nuclei -tags
+        cve,<blocked>` scan, else empty string. Called from `_shell` before
+        execution. Only fires when `cve` is in the tags AND at least one
+        non-scannable tech is combined with it — plain `-tags <tech>`
+        without `cve` is allowed (some tech-detect templates are useful)."""
+        low = command.lower().strip()
+        if not low.startswith("nuclei"):
+            return ""
+        # Extract the value of -tags <val> or --tags <val>
+        import re as _re
+        m = _re.search(r"(?:-tags|--tags)[= ]+([\w,\-.]+)", low)
+        if not m:
+            return ""
+        tags = set(t.strip() for t in m.group(1).split(","))
+        if "cve" not in tags:
+            return ""
+        blocked = tags & self._NUCLEI_NON_SCANNABLE_TAGS
+        if not blocked:
+            return ""
+        blocked_str = ", ".join(sorted(blocked))
+        return (f"ERROR: nuclei -tags cve,{blocked_str} rejected — "
+                f"{blocked_str} has no server-side CVE templates in "
+                f"nuclei-templates (CDN/tracker/frontend lib). Waste of "
+                f"scan budget. Move to a different tech or drop the `cve` "
+                f"tag if you only want tech-detect templates.")
+
     def maybe_inject_headers(self, command: str) -> tuple[str, str]:
         """Return (new_command, note). If custom_headers apply to any
         stage of `command` and the header is not already present, insert
@@ -621,6 +670,13 @@ class ToolRegistry:
     def _shell(self, command: str) -> str:
         if not command or not command.strip():
             return "ERROR: empty command"
+
+        # PN9 reinforce (2026-09-04): reject `nuclei -tags cve,<blocked>`
+        # scans before spending nuclei runtime on them. Returns the
+        # rejection reason so the LLM sees WHY and adapts on next turn.
+        _rej = self.maybe_reject_nuclei_scan(command)
+        if _rej:
+            return _rej
 
         # Header injection is now performed BEFORE dispatch (see
         # `maybe_inject_headers` and BaseAgent._process_tool_call).

@@ -280,10 +280,97 @@ def _cvss_to_severity(score) -> str:
     return "info"
 
 
+def _version_ge(a: str, b: str) -> bool:
+    """True if version `a` >= version `b`. Best-effort tuple compare —
+    strips non-digit chars per component. Returns False on empty/None
+    (so callers can treat 'unknown' as 'don't skip'). Used by PN11 fix
+    to skip CVEs where the detected version is already >= fixed_in."""
+    if not a or not b or str(a) == "?" or str(b) == "?":
+        return False
+
+    def _tuple(v: str) -> tuple:
+        parts: list[int] = []
+        for p in str(v).replace("-", ".").split(".")[:5]:
+            try:
+                parts.append(int("".join(c for c in p if c.isdigit()) or "0"))
+            except ValueError:
+                parts.append(0)
+        while len(parts) < 5:
+            parts.append(0)
+        return tuple(parts)
+    try:
+        return _tuple(a) >= _tuple(b)
+    except Exception:
+        return False
+
+
+def _plugin_confirmation(state, slug: str, target: str) -> tuple[str | None, str]:
+    """PN11 fix (2026-09-04): return (confirmation_source, version) for a
+    plugin slug wpscan reported, or (None, '?') if there's no independent
+    evidence the plugin actually exists on the target.
+
+    Confirmation sources, in order:
+      1. `fingerprint` — the fingerprint agent already emitted a finding
+         `<slug> detected on <target>` (nuclei wordpress-plugin-detect
+         or asset URL parse).
+      2. `readme.txt` — a live HEAD/GET to `/wp-content/plugins/<slug>/
+         readme.txt` returned 200 + WordPress plugin marker
+         (`Contributors:`), with `Stable tag:` giving the version.
+      3. None — probably a wpscan `--plugins-detection aggressive`
+         brute-force false positive against a WAF that returns uniform
+         status (Cloudflare) or a hosting that 403s all `/wp-content/
+         plugins/` paths. CVEs of unknown-existence plugins are almost
+         always noise.
+
+    Only paths (1) and (2) get their CVEs emitted as findings. (3) goes
+    into `state.wpscan_unconfirmed_plugins` for the report to list."""
+    import re as _re
+    slug_low = slug.lower()
+
+    # (1) fingerprint agent finding with this slug
+    for f in (state.get("findings") or []):
+        if str(f.get("agent")) != "fingerprint":
+            continue
+        title = str(f.get("title", "")).lower()
+        if title.startswith(f"{slug_low} ") or title.startswith(f"{slug_low}:"):
+            return "fingerprint", "?"
+
+    # (2) live readme.txt probe — throttled 1 req per plugin (short circuit
+    # on any error). Uses `requests` from tools.py's stdlib chain to reuse
+    # the custom_headers. If requests unavailable, no-op.
+    try:
+        import requests
+    except Exception:
+        return None, "?"
+    base = target.rstrip("/")
+    from urllib.parse import urlparse as _up
+    if not _up(base).scheme:
+        return None, "?"
+    url = f"{base}/wp-content/plugins/{slug}/readme.txt"
+    try:
+        # PN11 note: no custom_headers injected here — the harness's
+        # ToolRegistry.custom_headers isn't in scope for this agent-level
+        # helper. Best-effort with a browser UA so CF doesn't 403-block.
+        r = requests.get(url, timeout=8, allow_redirects=False,
+                          verify=False,
+                          headers={"User-Agent":
+                                    "Mozilla/5.0 (compatible; bughunter-harness/1)"})
+    except requests.RequestException:
+        return None, "?"
+    if r.status_code != 200:
+        return None, "?"
+    body = r.text[:2000]
+    if "Contributors:" not in body:
+        return None, "?"
+    m = _re.search(r"Stable tag:\s*(\S+)", body)
+    version = m.group(1).strip() if m else "?"
+    return "readme.txt", version
+
+
 def _parse_wpscan_json_to_findings(state, agent_name: str,
                                      glob_pattern: str) -> int:
     """Parse every /tmp/<glob_pattern> wpscan JSON file into structured
-    findings. Returns the count added.
+    findings, with PN11 confirmation gate + version filter applied.
 
     Schema (WPScan --format json, condensed):
       {
@@ -340,27 +427,78 @@ def _parse_wpscan_json_to_findings(state, agent_name: str,
                                   version=theme_ver, vuln=v, target=target)
             added += 1
 
-        # Plugin vulnerabilities — the meat of what WPScan API delivers
+        # PN11 fix (2026-09-04): plugin vulnerabilities pass through a
+        # confidence gate BEFORE emit. `--plugins-detection aggressive`
+        # brute-forces plugin slugs against `/wp-content/plugins/<slug>/`;
+        # WAF/CF returning uniform status makes wpscan report every
+        # dictionary slug as "present" with no version → 99 findings,
+        # ~half likely FP. We now split plugins into:
+        #   confirmed   → CVEs get emitted (with version-vs-fixed_in filter)
+        #   unconfirmed → slug goes into state.wpscan_unconfirmed_plugins
+        #                  (report lists them separately, no CVEs)
         plugins = data.get("plugins") or {}
+        confirmed_plugins: list[dict] = []
+        unconfirmed_plugins: list[str] = []
+        cves_skipped_patched = 0
         for slug, p in plugins.items():
-            ver = (p.get("version") or {}).get("number", "?")
+            ver_wpscan = (p.get("version") or {}).get("number", "?")
+            source, ver_readme = _plugin_confirmation(state, slug, target)
+            if not source:
+                unconfirmed_plugins.append(slug)
+                continue
+            # readme.txt version is more authoritative than wpscan's ?
+            resolved_ver = ver_readme if (ver_readme and ver_readme != "?") \
+                                       else ver_wpscan
+            confirmed_plugins.append({
+                "slug": slug, "version": resolved_ver, "source": source,
+                "vulns": p.get("vulnerabilities") or [],
+            })
             vulns = p.get("vulnerabilities") or []
             if not vulns:
-                # Still emit an INFO entry so the report shows what was
-                # enumerated, even without CVE match (useful for op audit).
                 state.add_finding(
                     agent=agent_name, severity="info",
-                    title=f"WordPress plugin enumerated: {slug} {ver}",
-                    evidence=f"wpscan detected {slug} v{ver} on {target}",
+                    title=f"WordPress plugin enumerated: {slug} "
+                          f"{resolved_ver} (via {source})",
+                    evidence=f"wpscan detected {slug} v{resolved_ver} "
+                             f"on {target} — confirmed by {source}",
                     recommendation=("No known CVEs in WPScan DB for this "
                                      "version at scan time — verify manually."))
                 added += 1
                 continue
             for v in vulns:
-                _emit_wpscan_finding(state, agent_name,
-                                      kind="Plugin", slug=slug,
-                                      version=ver, vuln=v, target=target)
+                fixed_in = str(v.get("fixed_in") or "").strip()
+                # PN11: skip CVEs where the resolved version is already
+                # patched (only when we know both versions).
+                if fixed_in and resolved_ver and resolved_ver != "?" \
+                        and _version_ge(resolved_ver, fixed_in):
+                    cves_skipped_patched += 1
+                    continue
+                _emit_wpscan_finding(
+                    state, agent_name,
+                    kind="Plugin", slug=slug,
+                    version=resolved_ver, vuln=v, target=target,
+                    confirmation_source=source)
                 added += 1
+
+        if unconfirmed_plugins:
+            # Append to session-sticky list — report will render a
+            # dedicated section with these.
+            existing = state.get("wpscan_unconfirmed_plugins") or []
+            merged = sorted(set(existing) | set(unconfirmed_plugins))
+            state.set("wpscan_unconfirmed_plugins", merged)
+            state.log(agent_name, "info",
+                       f"wpscan reported {len(unconfirmed_plugins)} plugin "
+                       f"slug(s) with NO independent evidence of presence "
+                       f"(fingerprint miss + readme.txt not accessible) "
+                       f"— CVEs of those slugs suppressed to avoid FP. "
+                       f"See '## WordPress plugins brute-forced by wpscan "
+                       f"(unconfirmed)' in REPORT.")
+
+        if cves_skipped_patched:
+            state.log(agent_name, "info",
+                       f"wpscan JSON parser: skipped {cves_skipped_patched} "
+                       f"CVE(s) already patched by the detected plugin "
+                       f"version(s) — no need to alert.")
 
     if added:
         state.log(agent_name, "info",
@@ -370,7 +508,8 @@ def _parse_wpscan_json_to_findings(state, agent_name: str,
 
 
 def _emit_wpscan_finding(state, agent_name: str, kind: str, slug: str,
-                          version: str, vuln: dict, target: str) -> None:
+                          version: str, vuln: dict, target: str,
+                          confirmation_source: str = "") -> None:
     title = str(vuln.get("title") or "").strip()[:200]
     cvss = (vuln.get("cvss") or {})
     score = cvss.get("score")
@@ -381,7 +520,10 @@ def _emit_wpscan_finding(state, agent_name: str, kind: str, slug: str,
     cve_str = ", ".join(f"CVE-{c}" if not str(c).startswith("CVE-") else c
                          for c in cves[:5])
     fixed_in = vuln.get("fixed_in") or "unknown"
-    ev = f"{kind} {slug} v{version} on {target} — CVSS={score} · Fixed in: {fixed_in}"
+    conf_tag = f" · confirmed via {confirmation_source}" \
+               if confirmation_source else ""
+    ev = (f"{kind} {slug} v{version} on {target} — CVSS={score} · "
+           f"Fixed in: {fixed_in}{conf_tag}")
     if cve_str:
         ev += f" · {cve_str}"
     rec = f"Upgrade {slug} to >= {fixed_in}."
