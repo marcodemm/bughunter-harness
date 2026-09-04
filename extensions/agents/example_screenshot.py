@@ -151,18 +151,28 @@ class ScreenshotAgent(BaseAgent):
                           f"partial screenshots may still be on disk.")
 
             captured: list[dict] = []
+            from urllib.parse import urlparse as _up
             for u in urls:
-                # gowitness names PNGs by URL slug; we scan the dir for
-                # any file that references the host part.
-                host_slug = u.split("://", 1)[-1].split(":", 1)[0].replace(".", "_")
-                pngs = list(shots_dir.glob(f"*{host_slug}*.png"))
-                if not pngs:
-                    pngs = list(shots_dir.glob(
-                        f"*{host_slug.replace('_','-')}*.png"))
+                # Iter 14 fix (2026-09-05): gowitness v3 writes `.jpeg`
+                # by default (was `.png` in v2), and the filename keeps
+                # the hostname's dots intact (e.g. `https---www.
+                # example.com-443.jpeg`). Look up by literal hostname
+                # and accept jpeg/jpg/png so both codebases match.
+                hostname = _up(u).hostname or u.split("://", 1)[-1].split(
+                    "/", 1)[0].split(":", 1)[0]
+                imgs: list = []
+                for ext in ("jpeg", "jpg", "png"):
+                    imgs.extend(shots_dir.glob(f"*{hostname}*.{ext}"))
+                # Fallback: v2-style slug with underscores
+                if not imgs:
+                    host_slug = hostname.replace(".", "_")
+                    for ext in ("jpeg", "jpg", "png"):
+                        imgs.extend(shots_dir.glob(f"*{host_slug}*.{ext}"))
                 captured.append({
                     "url": u,
-                    "file": str(pngs[0].relative_to(self.run_dir)) if pngs else "",
-                    "ok": bool(pngs),
+                    "file": str(imgs[0].relative_to(self.run_dir))
+                            if imgs else "",
+                    "ok": bool(imgs),
                 })
 
             # Write a tiny HTML gallery so the operator can page through
