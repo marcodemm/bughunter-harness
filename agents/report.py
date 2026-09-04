@@ -550,15 +550,24 @@ class ReportAgent(BaseAgent):
             # when WP core is 6.x, or `Yoast SEO:28.4` when 22-24 is
             # current. Warns without blocking — often it's a bad-detect
             # from httpx tech-detect confusing plugin version with core.
+            # LAST REVIEWED 2026-09-04 (verified against official vendor
+            # release pages — WordPress 7.1 stable, Drupal 11.4.6, Joomla
+            # 6.1.3, Yoast SEO 28.4, PHP 8.5 available, nginx mainline
+            # 1.31.5, Apache HTTP 2.4.68). Ceilings set well above the
+            # current version to absorb 2-4 major releases before the
+            # meta-check starts false-positiving. Iter-11 fix after two
+            # confirmed FPs (wordpress:7.0.4 and yoast:28.4 were flagged
+            # as bad-detects when they were the real current version).
+            # RE-REVIEW every 6 months and update the numbers + this line.
             _IMPLAUSIBLE_TECH_RANGES = {
-                "wordpress": ("3.0", "6.99"),
-                "drupal": ("6.0", "12.99"),
-                "joomla": ("2.0", "6.99"),
-                "yoast-seo": ("1.0", "25.99"),
-                "yoast seo": ("1.0", "25.99"),
-                "php": ("5.0", "8.99"),
-                "nginx": ("0.7", "1.99"),
-                "apache": ("1.3", "3.99"),
+                "wordpress": ("3.0", "9.99"),   # current 7.1
+                "drupal": ("6.0", "14.99"),      # current 11.4
+                "joomla": ("2.0", "9.99"),       # current 6.1
+                "yoast-seo": ("1.0", "34.99"),   # current 28.4 (fast-moving)
+                "yoast seo": ("1.0", "34.99"),
+                "php": ("5.0", "9.99"),          # current 8.5
+                "nginx": ("0.7", "2.99"),        # current mainline 1.31
+                "apache": ("1.3", "3.99"),       # current 2.4.68
             }
             def _tech_ver(t: str) -> tuple:
                 parts = []
