@@ -49,8 +49,13 @@ class TakeoverAgent(BaseAgent):
         pass                                  # parse tool outputs → findings
 ```
 
-The example takeover agent parses `subjack` output into structured findings
-with recommendation text. Copy it, rename the class + NAME, edit the
+The example takeover agent runs `nuclei -tags takeover -jsonl -o …`
+against every subdomain `recon` discovered and parses the JSONL file
+into structured findings (a `subjack` regex is also present in
+`after_run` as a safety net, kept for anyone who wants to re-add
+`subjack` behind the harness denylist — nuclei is the default because
+its takeover template set covers the same fingerprint DB and doesn't
+need `$(go env GOPATH)`). Copy it, rename the class + NAME, edit the
 `SYSTEM_PROMPT` and `after_run` for your own tool, and you have a new
 pipeline stage in under 30 lines.
 
@@ -91,6 +96,13 @@ finding_template:
 
 Only `binary` is required; everything else is optional context that
 propagates into the agents' system prompts.
+
+**Note on `example_subjack.yaml`**: the YAML is kept as a **shape** reference
+so you can see every optional field in one place, but the shipped takeover
+agent uses `nuclei -tags takeover` instead — `subjack` needs
+`$(go env GOPATH)/…/fingerprints.json` and `$( )` is on the shell denylist.
+If you install `subjack` and want to run it, add `--allow-substitution` in a
+custom wrapper; otherwise leave the file as a template for your own tool.
 
 **Where it lands at runtime**
 

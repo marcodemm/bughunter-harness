@@ -182,9 +182,13 @@ At the prompt:
 ```
 Objective (one-line goal for the agent). Type /quit or /bye to exit.
 Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH
+Target: bare URL, or --target URL (both work anywhere in the line)
+Example:  --target https://www.domain.com --scope *.domain.com --top-hosts 3 --complete
 
 > http://localhost:3000/
 ```
+
+The REPL accepts a full CLI-style line — paste the same string you'd use with `python harness.py …` from bash, or use only the flags you want and let the sticky ones from previous sessions carry over. Sticky flags echo a `[+] X set (sticky): Y` line when they land; setting a flag without a target no longer prints the help block.
 
 ![Bughunter Harness command-line interface — pipeline starting](images/application-command-line-interface.png)
 *Pipeline start — target and agent queue announced, first agents entering `RUNNING`.*
@@ -272,7 +276,12 @@ See `config.example.yaml` inline comments for every field.
 
 Default is single-host: the pipeline scans `state.live_hosts[0]` only. That's fine when your target is one URL, but on wildcard targets like `--scope "*.example.com"` you'd miss `admin.example.com` / `dev.example.com` / `api.example.com` etc.
 
-**Auto-activation**: if any `--scope` pattern starts with `*.` (a wildcard, e.g. `--scope '*.example.com'`), multi-host is **auto-enabled** for that run — it's almost always what you want on a wildcard target. Override with `--single-host` if you specifically want to scan only the primary URL.
+**Auto-activation** (two triggers, either one fires):
+
+1. **At startup — wildcard scope**: any `--scope` pattern starting with `*.` (e.g. `--scope '*.example.com'`) auto-enables multi-host before the pipeline runs. Predictable, explicit, doesn't depend on sub scoring — every sub `subfinder` discovers passes the scope gate.
+2. **Mid-pipeline — 2+ juicy in-scope subs**: even when the scope is a plain apex (`example.com`, no `*.`), if `sub_prioritizer` finds **2 or more** subs that are BOTH in-scope AND tier MEDIUM/HIGH/CRITICAL, the orchestrator escalates the remaining single-host agents to multi-host loop mode automatically. The report carries `state.multi_host_auto_escalated=True`. Backstop for the "operator forgot the `*.`" case — the wildcard form is still the recommended path when you know you want multi-host from the start.
+
+Override with `--single-host` if you specifically want to scan only the primary URL.
 
 **Enable multi-host manually** with `--multi-host` (per run) or `multi_host.enabled: true` in `config.yaml`. The pipeline splits into 3 phases:
 
@@ -562,6 +571,11 @@ Extensions are pure additions: they never modify or shadow core behaviour. A mal
 - **CVE-matches counter reflects reality** — the header's `**CVE matches:** N` now counts unique `CVE-YYYY-NNNNN` identifiers found in the findings evidence, not just entries the wordpress agent chose to append to `state.cves_matched`. Previously WPScan's `cvss.score=None` (common for older CVEs) → severity fell back to `info` → the CVE never made it to the counter. Also, `_emit_wpscan_finding` now appends to `state.cves_matched` whenever the vuln carries a real CVE-id (regardless of severity), so both paths (counter and list) reflect the same truth.
 - **Implausible tech version meta-check** — the meta-check block warns when the aggregated tech list contains an out-of-range version (e.g. `WordPress:7.1` when WP core is 6.x, or `Yoast SEO:28.4` when 22-24 is current). Almost always a bad-detect from httpx `-tech-detect` confusing a plugin/theme version with the parent product. The warning tells the operator that downstream CVE lookups against that version will return zero (the version doesn't exist).
 - **Nuclei JSONL sink + metrics** — every nuclei call the agents run writes to `/tmp/harness-nuclei-*.jsonl` (deterministic output independent of stdout truncation). The parser logs `total_lines=N json_records=M → findings_added=X` so you can tell the difference between "nuclei found nothing" and "nuclei found 40 things but all got filtered as info/-detect".
+- **Nuclei tag normalisation (shell layer + prompt)** — nuclei template tags are kebab-case slugs; the LLM often copies a display name from fingerprint (`Apache HTTP Server`, `Google Tag Manager`, `jQuery Migrate`, `PHP:8.4.24`) into `-tags` without normalising, and nuclei then either sees positional args or matches zero templates. `tools.py::maybe_reject_nuclei_scan` now also intercepts `-tags <val>` (space-separated form) and `-tags=<val>` (equals form with a space inside the value) and returns a clear ERROR the LLM sees on the next turn with worked examples: `'Apache HTTP Server' → 'apache-http-server'`, `'PHP:8.4.24' → 'php'` (strip `:version`). The web_vuln prompt carries the same guidance up-front so the correct form is used from the first call.
+- **Multi-host auto-escalate mid-pipeline** — right after `sub_prioritizer`, if 2+ hosts in `state.prioritized_hosts` are both in-scope AND tier MEDIUM/HIGH/CRITICAL, `orchestrator._should_auto_escalate_multi_host()` fires and the remaining agents (fingerprint / content_discovery / login_probe / web_vuln / wordpress / api_fuzzer / auth / report) switch to the multi-host loop with `[target-original] + [in-scope subs]` as the queue. Fills the gap the startup wildcard trigger left: a scope like `example.com` (plain apex, no `*.`) that still catches subs via `subfinder`+scope-matching. `state.multi_host_auto_escalated=True` in the report so the reader can distinguish auto-escalated runs from explicitly-multi-host ones.
+- **Takeover uses nuclei ONLY (no fallback)** — the takeover extension's prompt is a hard "nuclei is the only tool" rule with the failure modes of the alternatives spelled out (`subjack` needs `$(go env GOPATH)` which is on the shell denylist; `subzy` / `naabu` aren't installed by default → `exit=127` burns a turn). Removed the previous "if the binary is not installed, fall back to nuclei" wording — the LLM was reading it as an invitation to try subjack first. One `nuclei -l /tmp/harness-subs.txt -tags takeover -jsonl -o …` call and `finish()`; no retries on `exit=0`.
+- **Optional-tool pre-check at startup** — `Orchestrator._precheck_optional_tools()` runs `which` on a fixed list of common alternates (`subjack`, `subzy`, `naabu`, `amass`, `hakrawler`, `gospider`, `meg`, `gowitness`, `eyewitness`, `dnstwist`, `assetfinder`, `chaos-client`) and publishes the missing ones to `state.missing_tools`. Agents can read the list from `build_objective` and warn the LLM ("Tools NOT installed on this host — DO NOT try them"). The recon agent already does this for its own subset — cuts the LLM's `exit=127` retry loop on absent binaries.
+- **REPL sticky flags — CLI-style paste + confirmations** — the REPL accepts the same CLI-style line you'd run from bash: `--target URL --scope PAT --top-hosts N --complete` (in any order, and either as a bare positional or via `--target`). Every sticky flag prints a `[+] X set (sticky): Y` confirmation as soon as it lands. A line that only carries flags (no target) no longer prints the help block — it just applies the flags and returns to the prompt. All flags persist across sessions within the same REPL invocation, so you set the sticky ones once and only type the new target on each subsequent run.
 
 ---
 
