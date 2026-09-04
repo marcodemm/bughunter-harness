@@ -124,16 +124,33 @@ class TyposquatAgent(BaseAgent):
                     idx = proc.stdout.find("[")
                     parsed = (json.loads(proc.stdout[idx:])
                               if idx >= 0 else [])
+                dropped_subdomain_fp = 0
                 for row in (parsed or [])[:max_perm]:
                     dom = row.get("domain") or row.get("domain-name")
                     if not dom or dom == apex:
                         continue
+                    fuzzer = row.get("fuzzer") or row.get("fuzzer-type") or ""
+                    # PN21 iter 14 (2026-09-05): dnstwist's `subdomain`
+                    # fuzzer splits the original domain arbitrarily and
+                    # checks whether "<left>.<right>" resolves as a
+                    # subdomain of a REAL "<right>" domain. When the
+                    # split's right half is itself a valid registered
+                    # 2LD (e.g. some real country-code 2LDs happen to
+                    # be word-shaped and appear inside longer english
+                    # words), the finding is `<fragment>.<other-real-
+                    # domain>` — an unrelated subdomain of an unrelated
+                    # domain, NOT a typosquat of the original. Drop
+                    # these by requiring the 2LD of the candidate to
+                    # match the 2LD of the original apex.
+                    if fuzzer == "subdomain":
+                        if _2ld(dom) != _2ld(apex):
+                            dropped_subdomain_fp += 1
+                            continue
                     dns_a = row.get("dns_a") or row.get("dns-a") or []
                     ns = row.get("dns_ns") or row.get("dns-ns") or []
                     mx = row.get("dns_mx") or row.get("dns-mx") or []
                     who = (row.get("whois_created")
                            or row.get("whois-created") or "")
-                    fuzzer = row.get("fuzzer") or row.get("fuzzer-type") or ""
                     candidates.append({
                         "domain": dom,
                         "fuzzer": fuzzer,
@@ -143,6 +160,12 @@ class TyposquatAgent(BaseAgent):
                         "mx": mx if isinstance(mx, list) else [mx],
                         "whois_created": who,
                     })
+                if dropped_subdomain_fp:
+                    state.log(self.NAME, "info",
+                               f"dropped {dropped_subdomain_fp} `subdomain`-"
+                               f"fuzzer FP(s) whose 2LD doesn't match `{apex}` "
+                               f"(these are subs of unrelated real domains, "
+                               f"not typosquats of the target).")
 
             state.set("typosquat_candidates", candidates)
             state.log(self.NAME, "info",
@@ -181,6 +204,33 @@ def _extract_apex(target: str) -> str:
 
 
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+# Common multi-part TLDs where the "2LD" concept needs 3 labels
+# (e.g. `example.co.uk`, `example.com.br`). Best-effort — not a full
+# PSL parse. Add more as we run into false positives.
+_MULTIPART_TLDS = {
+    "co.uk", "co.jp", "co.kr", "co.nz", "co.za",
+    "com.br", "com.mx", "com.ar", "com.au", "com.pe",
+    "com.co", "com.tr", "com.tw", "com.hk",
+    "org.uk", "gov.uk", "ac.uk", "net.au",
+}
+
+
+def _2ld(host: str) -> str:
+    """Return the second-level registrable part of `host` — a poor-
+    man's PSL. `www.example.com` → `example.com`, `sub.example.co.uk`
+    → `example.co.uk`. When the last two labels match a known
+    multi-part TLD, keep the third label; else keep the last two."""
+    if not host:
+        return ""
+    parts = host.lower().strip(".").split(".")
+    if len(parts) < 2:
+        return host.lower()
+    last2 = ".".join(parts[-2:])
+    if last2 in _MULTIPART_TLDS and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return last2
 
 
 def _is_ip_or_local(host: str) -> bool:

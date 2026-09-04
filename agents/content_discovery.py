@@ -359,6 +359,54 @@ SHELL SYNTAX — CRITICAL (repeated denylist violations kill turn budget):
                        f"HEAD-probe filter: {len(confirmed)} endpoint(s) "
                        f"confirmed status 2xx/3xx, {len(negative)} probed "
                        f"negative (4xx/5xx/000) — see REPORT sections")
+        # PN22a iter 14 (2026-09-05): if the harvest and filter ended
+        # with 0 confirmed endpoints, emit an explicit line so the
+        # operator (and the report) don't have to infer it from the
+        # absence of the section header. Common on small sites with
+        # no Wayback / gau history.
+        if not confirmed and not negative:
+            state.log(self.NAME, "info",
+                       f"HEAD-probe filter: 0 endpoint(s) confirmed — "
+                       f"the harvest produced {len(found)} candidate URL(s), "
+                       f"{dropped_off_scope} dropped as off-scope, "
+                       f"{dropped_invalid} malformed, "
+                       f"{dropped_truncated} truncated. Target likely has a "
+                       f"minimal Wayback/gau footprint.")
+        # PN22b iter 14 (2026-09-05): downstream agents (auth, api_fuzzer)
+        # gate on `endpoints_found` being non-empty. When the target is
+        # alive but the crawl produced nothing (small site / no
+        # historical footprint), seed a small set of "always try"
+        # endpoints so the auth agent can at least probe the REST API
+        # and the deterministic `_wp_user_enum` parser has input.
+        # Seeds are marked `via=content_discovery_seed` so the report
+        # can distinguish them from real crawl hits.
+        if not confirmed:
+            seed_hosts = []
+            for h in (state.get("live_hosts") or [])[:3]:
+                scheme = h.get("scheme", "https")
+                host = h.get("host", "")
+                if host:
+                    seed_hosts.append(f"{scheme}://{host}")
+            if seed_hosts:
+                seeds = []
+                _SEED_PATHS = ["/", "/wp-json/wp/v2/users", "/wp-login.php",
+                                "/robots.txt", "/sitemap.xml"]
+                for base in seed_hosts:
+                    for p in _SEED_PATHS:
+                        seeds.append({
+                            "url": f"{base}{p}",
+                            "via": "content_discovery_seed",
+                            "status": None,  # not probed — seed only
+                        })
+                state.extend("endpoints_found", seeds)
+                state.log(self.NAME, "info",
+                           f"PN22b seed fallback: added {len(seeds)} "
+                           f"canonical endpoint(s) (`/`, `/wp-json/wp/v2/"
+                           f"users`, `/wp-login.php`, `/robots.txt`, "
+                           f"`/sitemap.xml` × {len(seed_hosts)} live host(s)) "
+                           f"so downstream agents (auth, api_fuzzer) have "
+                           f"something to probe. Seeds are unverified — the "
+                           f"auth agent will HEAD/GET them anyway.")
 
 
 def _first_live_host(state):

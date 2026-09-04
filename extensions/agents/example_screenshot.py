@@ -73,6 +73,32 @@ class ScreenshotAgent(BaseAgent):
             timeout_per_host = int(cfg.get("timeout_per_host_sec", 15))
             resolution = str(cfg.get("resolution", "1440,900"))
 
+            # Iter 14 (2026-09-05): bump per-host timeout when the
+            # fingerprint agent detected a WAF/CDN that likely serves
+            # a challenge page (JS interstitial, Turnstile, Bot
+            # Management landing). gowitness has to wait for the
+            # JS-rendered page to settle before the screenshot, so a
+            # tight 15s timeout truncates before the real content
+            # loads and returns empty PNGs / blank browsers. Bumps
+            # only when we have evidence — otherwise the default
+            # stays fast.
+            _WAF_MARKERS = ("cloudflare", "modsecurity", "modsecurityowasp",
+                             "datadome", "sucuri", "akamai", "perimeterx",
+                             "imperva", "reblaze", "wallarm")
+            techs = [str(t).lower() for t in
+                     (state.get("detected_techs") or [])]
+            waf_present = any(any(m in t for m in _WAF_MARKERS)
+                              for t in techs)
+            if waf_present and timeout_per_host < 30:
+                orig_to = timeout_per_host
+                timeout_per_host = int(cfg.get(
+                    "timeout_per_host_sec_waf", 30))
+                state.log(self.NAME, "info",
+                           f"WAF/CDN detected in fingerprint (bumping "
+                           f"per-host timeout {orig_to}s → "
+                           f"{timeout_per_host}s to survive JS "
+                           f"challenge / interstitial pages).")
+
             # Belt-and-braces re-check (also done in entry_condition)
             if shutil.which("gowitness") is None:
                 state.log(self.NAME, "info",
