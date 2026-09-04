@@ -951,6 +951,10 @@ REPL_COMMANDS_HINT = """\
 Available REPL commands:
   /quit  /bye  /exit      exit the harness (also: quit / bye / exit)
 
+Target (either form works — put --target anywhere, or a bare token):
+  --target URL                  target URL/host (alias for a bare positional)
+  URL                           bare positional (no flag) — same effect
+
 Sticky inline flags (persist across sessions):
   --email ADDR                  mail report destination
   --scope PAT                   in-scope allowlist (repeatable)
@@ -1131,7 +1135,12 @@ def _looks_like_target(line: str) -> bool:
 def parse_repl_line(line: str) -> tuple[str, dict]:
     """Parse a REPL objective line, stripping inline flags.
 
-    Supports (all sticky across sessions once set):
+    Supports (all sticky across sessions once set, except --target which
+    only names the current run's target):
+      --target URL             (or --target=URL)      → joins the positional
+                                                         objective bucket
+                                                         (same as writing the
+                                                         URL as a bare token)
       --email ADDR             (or --email=ADDR)      → overrides['email']
       --scope PATTERN          (or --scope=PATTERN)   → overrides['scope'] (list, repeatable)
       -o PATH / --output PATH  (or --output=PATH)     → overrides['output']
@@ -1141,10 +1150,13 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
       --scope ""    → clears scope list (revert to scope.txt)
       -o ""         → clears output override
 
-    Example:
+    Examples:
       '--email me@x.com --scope *.foo.com recon foo.com'
         → ('recon foo.com',
            {'email': 'me@x.com', 'scope': ['*.foo.com']})
+      '--target https://x.com --scope *.x.com --top-hosts 3 --complete'
+        → ('https://x.com',
+           {'scope': ['*.x.com'], 'top_hosts': 3, 'quick_mode': False})
     """
     import shlex
     try:
@@ -1162,6 +1174,19 @@ def parse_repl_line(line: str) -> tuple[str, dict]:
 
     while i < len(tokens):
         t = tokens[i]
+        # --target URL — 2026-09-04 UX: alias for putting the URL as
+        # a bare token. Lets the operator paste a full CLI-style line
+        # ('--target URL --scope PAT --complete') straight into the
+        # REPL without stripping --target first. The URL joins the
+        # `remaining` bucket exactly like a bare positional would, so
+        # downstream _looks_like_target / run_repl treat both forms
+        # identically.
+        if t == "--target" and i + 1 < len(tokens):
+            remaining.append(tokens[i + 1])
+            i += 2; continue
+        if t.startswith("--target="):
+            remaining.append(t.split("=", 1)[1])
+            i += 1; continue
         # --email
         if t == "--email" and i + 1 < len(tokens):
             overrides["email"] = tokens[i + 1]
@@ -1286,12 +1311,14 @@ def prompt_for_objective(is_first: bool) -> str | None:
             print("\nObjective (one-line goal for the agent). "
                   "Type /quit or /bye to exit.")
             print("Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH")
-            print("Example (CLI): python harness.py --target https://www.dominio.com --scope '*.dominio.com' --top-hosts 5 --complete")
+            print("Target: bare URL, or --target URL (both work anywhere in the line)")
+            print("Example: --target https://www.dominio.com --scope '*.dominio.com' --top-hosts 3 --complete")
         else:
             print("\n─── Previous session ended ───")
             print("New objective (or /quit / /bye to exit).")
             print("Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH")
-            print("Example (CLI): python harness.py --target https://www.dominio.com --scope '*.dominio.com' --top-hosts 5 --complete")
+            print("Target: bare URL, or --target URL (both work anywhere in the line)")
+            print("Example: --target https://www.dominio.com --scope '*.dominio.com' --top-hosts 3 --complete")
         line = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n[!] Cancelled.")
