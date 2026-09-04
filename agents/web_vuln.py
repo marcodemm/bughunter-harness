@@ -66,6 +66,21 @@ the actual detected_techs (max 3 combined).
      coolify, portainer, n8n.
      NEVER: `-tags cve` alone (times out). ALWAYS combine with a product tag.
 
+     PN15 fix (2026-09-04): tag names are kebab-case slugs — NO spaces,
+     NO uppercase, NO `:version` suffixes. The tech list from fingerprint
+     often uses display form (`Apache HTTP Server`, `Google Tag Manager`,
+     `jQuery Migrate`, `PHP:8.4.24`). Normalize BEFORE passing to -tags:
+       'Apache HTTP Server'         → 'apache-http-server'
+       'Google Tag Manager'         → 'google-tag-manager'
+       'jQuery Migrate'             → 'jquery-migrate'
+       'PHP:8.4.24'                 → 'php'          (strip :version)
+       'WordPress:7.1'              → 'wordpress'    (strip :version)
+     Wrong: `-tags cve,apache http server`  (3 positional tokens → nuclei
+       ignores 'http' 'server' as bad args, matches ZERO templates).
+     Right: `-tags cve,apache-http-server` (single kebab-case slug).
+     Rejector at the shell layer bounces the wrong form back before nuclei
+     starts, so retry with the normalised tag when you see that error.
+
      PN9 fix (2026-09-04): DO NOT combine `cve` with any of these techs
      — they have essentially no server-side CVE templates in
      nuclei-templates and every scan against them wastes ~90s of budget

@@ -34,12 +34,18 @@ already found by the recon agent, detect ones with dangling CNAMEs that
 point to unclaimed third-party services (S3 buckets, GitHub Pages,
 Heroku, Fastly, Netlify, Azure blob, etc.).
 
-PN6 fix (2026-09-04): use `nuclei -tags takeover` as the ONLY tool.
-`subjack` was the historical preferred tool but requires `$(go env GOPATH)`
-substitution to locate its fingerprints.json, and `$( )` is on the
-harness command denylist. nuclei-templates ships an equivalent takeover
-template set that covers the same fingerprint database. Simpler and
-works out of the box.
+TAKEOVER TOOLING RULE — hard, non-negotiable (PN6 iter 7 + reinforce iter 9):
+
+`nuclei -tags takeover` is the ONLY tool this agent runs. DO NOT try
+`subjack`, `subzy`, `takeover`, or any other tool — nuclei-templates
+ships an equivalent takeover fingerprint set that covers the same
+services (S3, GitHub Pages, Heroku, Fastly, Netlify, Azure Blob, …).
+
+Why other tools fail on this harness (do not try to "fall back"):
+  - subjack     → requires `$(go env GOPATH)/…/fingerprints.json` and
+                  `$( )` is on the shell denylist → rejected outright.
+  - subzy       → not installed by default; `exit=127` burns a turn.
+  - dnsx alone  → no takeover fingerprint DB; only resolves CNAMEs.
 
 CRITICAL: ALWAYS include
       -jsonl -o /tmp/harness-nuclei-takeover.jsonl
@@ -49,17 +55,20 @@ the shell wrapper).
 Workflow (one tool_call per turn):
   1. Write subdomains to /tmp/harness-subs.txt (one per line, `cat > file
      << 'EOF' … EOF` style — the harness accepts heredocs).
-  2. Run:
+  2. Run EXACTLY ONE nuclei call:
        nuclei -l /tmp/harness-subs.txt -tags takeover -silent -rl 5 -c 5 \
          -jsonl -o /tmp/harness-nuclei-takeover.jsonl
   3. finish() with any confirmed takeovers as:
        ["critical — <sub> — dangling CNAME to <service> — unclaimed"]
+     If nuclei returned exit=0 with an empty JSONL, finish() with an
+     empty findings list — do NOT try alternative tools "to be sure".
 
 Rules:
   - Do NOT try to claim / register / take over the resource yourself.
     Just PROVE it is takeoverable and stop.
-  - If the binary is not installed, fall back to nuclei; if neither works,
-    finish() with an empty findings list and a summary explaining why.
+  - Do NOT run any tool other than the one nuclei call in step 2.
+  - Do NOT retry nuclei with different flags on exit=0; a clean run is
+    a clean run.
 """
 
     def entry_condition(self, state) -> bool:

@@ -200,6 +200,14 @@ class Orchestrator:
         print(f"[+] Target: {self.target}")
         print(f"[+] Agents queued: {', '.join(self.agent_names)}")
 
+        # PN-tool-precheck iter 9 (2026-09-04): probe optional binaries
+        # once at startup and publish the missing list to shared_state.
+        # Agents that reference these tools in their prompt can read
+        # `state.missing_tools` from build_objective() and add a
+        # "Do NOT try X — not installed" hint. Prevents the LLM from
+        # burning turns on `exit=127` for `subjack` / `naabu` / etc.
+        self._precheck_optional_tools()
+
         # Pre-flight — three modes:
         #   1) --skip-preflight   → do not probe (VPN/allowlist targets)
         #   2) default (soft)     → probe; if unreachable, WARN + continue
@@ -297,6 +305,35 @@ class Orchestrator:
                                    "removed": removed[:50]})
         return self.state
 
+    def _precheck_optional_tools(self) -> None:
+        """PN-tool-precheck iter 9: `which <bin>` for a fixed list of
+        optional offensive tools; publish those NOT installed to
+        `state.missing_tools` (list of names) so agents can hint the LLM
+        to skip them.
+
+        Only optional tools listed here — the harness's core binaries
+        (nuclei, curl, subfinder) are assumed present; if they're
+        missing the individual agent's SKIP handling triggers a clear
+        error already. This list is what agents' prompts historically
+        suggested as fallbacks and where `exit=127` burns turns
+        silently (subjack, naabu, subzy)."""
+        import shutil
+        _OPTIONAL = [
+            "subjack", "subzy", "naabu", "amass", "hakrawler", "unfurl",
+            "gospider", "meg", "gowitness", "eyewitness",
+            "dnstwist", "assetfinder", "chaos-client",
+        ]
+        missing: list[str] = []
+        for bin_name in _OPTIONAL:
+            if shutil.which(bin_name) is None:
+                missing.append(bin_name)
+        if missing:
+            self.state.set("missing_tools", missing)
+            print(f"[+] Optional tools NOT installed (agents will be told "
+                  f"to skip): {', '.join(missing)}")
+        else:
+            self.state.set("missing_tools", [])
+
     def _target_reachable(self, target: str,
                           timeout_sec: int = 10) -> tuple[bool, str]:
         """Best-effort pre-flight check. Returns (alive, reason).
@@ -347,7 +384,8 @@ class Orchestrator:
 
     # ── single-host pipeline (default) ──────────────────────────────
     def _run_single_host(self, ui) -> None:
-        for AgentCls in self.agent_order:
+        escalated_to_mh = False
+        for i, AgentCls in enumerate(self.agent_order):
             # In quick mode, skip agents that opted out via RUNS_IN_QUICK=False
             if self.quick_mode and not getattr(AgentCls, "RUNS_IN_QUICK", True):
                 reason = "quick mode (RUNS_IN_QUICK=False)"
@@ -357,6 +395,120 @@ class Orchestrator:
                 ui.notify(f"skipped {AgentCls.NAME} ({reason})")
                 continue
             self._run_one_agent(AgentCls, self.state, ui)
+
+            # PN16 iter 9 (2026-09-04): auto-escalate to multi-host loop
+            # once sub_prioritizer has ranked the live hosts and we see
+            # that 2+ subs in-scope reached tier MEDIUM+. The auto-trigger
+            # at REPL startup (harness.py) only fires on a wildcard scope
+            # pattern (`*.foo.com`) — but a scope that is just the apex
+            # (`foo.com`) still catches subs and the same "please look at
+            # each juicy sub" intent applies. Without this escalate,
+            # single-host mode picks live_hosts[0] and never scans the
+            # rest. Iter 9 run 20260904T102155Z showed exactly this bug:
+            # 3 live subs (nube MEDIUM, mail MEDIUM, www LOW) — web_vuln
+            # scanned only the top-priority sub and the WordPress sub (which had
+            # Elementor Pro 3.20.0) was ignored.
+            if (not escalated_to_mh
+                    and AgentCls.NAME == SubPrioritizerAgent.NAME
+                    and self._should_auto_escalate_multi_host()):
+                remaining = self.agent_order[i + 1:]
+                self._pn16_continue_as_multi_host(remaining, ui)
+                escalated_to_mh = True
+                return
+
+    def _should_auto_escalate_multi_host(self) -> bool:
+        """PN16 iter 9: decide whether to escalate a single-host run to
+        multi-host loop mode after sub_prioritizer.
+
+        Returns True when 2+ hosts in `state.prioritized_hosts` are both
+        in-scope AND tiered MEDIUM/HIGH/CRITICAL. Below that threshold
+        the single-host loop is fine (one host in play, or every sub
+        looks LOW-value)."""
+        prioritized = self.state.get("prioritized_hosts") or []
+        if len(prioritized) < 2:
+            return False
+        _JUICY = {"MEDIUM", "HIGH", "CRITICAL"}
+        in_scope_juicy = 0
+        for p in prioritized:
+            host = str(p.get("host", ""))
+            tier = str(p.get("tier", "")).upper()
+            if not host or tier not in _JUICY:
+                continue
+            try:
+                if self.tools.scope.is_in_scope(host):
+                    in_scope_juicy += 1
+            except Exception:
+                pass
+            if in_scope_juicy >= 2:
+                return True
+        return False
+
+    def _pn16_continue_as_multi_host(self, remaining: list, ui) -> None:
+        """Run `remaining` agents in multi-host loop mode: repeated
+        agents go once per top-N sub, non-repeated go once, report is
+        last. Mirrors `_run_multi_host` Phase 2/3 semantics but only
+        for the agents that hadn't run yet in the single-host pass."""
+        mh_cfg = self.cfg.get("multi_host") or {}
+        top_n = int(mh_cfg.get("top_n", 3))
+        min_score = int(mh_cfg.get("min_score", 30))
+        repeated_names = set(mh_cfg.get(
+            "agents_to_repeat", _MULTI_HOST_REPEATED_DEFAULT))
+
+        prioritized = self.state.get("prioritized_hosts") or []
+        selected = [p for p in prioritized[:top_n]
+                    if p.get("score", 0) >= min_score]
+        if not selected:
+            selected = prioritized[:top_n]
+        from urllib.parse import urlparse as _up
+        orig_host = _up(self.state.get("target") or "").hostname
+        in_scope_selected: list[dict] = []
+        for p in selected:
+            host = str(p.get("host", ""))
+            if not host or host == orig_host:
+                continue
+            try:
+                if self.tools.scope.is_in_scope(host):
+                    in_scope_selected.append(p)
+            except Exception:
+                pass
+        orig_pri = {
+            "host": orig_host or self.state.get("target", ""),
+            "score": 999,
+            "tier": "ORIGINAL",
+            "components": {"note": "operator-supplied target — always first"},
+        }
+        final_queue = [orig_pri] + in_scope_selected
+        ui.notify(f"PN16 auto-escalate: 2+ in-scope MEDIUM+ subs → "
+                  f"switching remaining agents to multi-host loop. "
+                  f"Queue = {len(final_queue)} host(s): "
+                  + ", ".join(str(p.get("host")) for p in final_queue))
+        self.state.set("multi_host_auto_escalated", True)
+        # Phase 2: repeated agents once per sub; non-repeated once
+        remaining_repeated = [A for A in remaining
+                              if getattr(A, "NAME", "") in repeated_names]
+        remaining_non_repeated = [A for A in remaining
+                                   if getattr(A, "NAME", "") not in repeated_names
+                                   and A is not ReportAgent]
+        # Non-repeated first (they take state as-is, before the per-sub loop
+        # potentially mutates live_hosts ordering)
+        for A in remaining_non_repeated:
+            if self.quick_mode and not getattr(A, "RUNS_IN_QUICK", True):
+                reason = "quick mode (RUNS_IN_QUICK=False)"
+                ui.hook(A.NAME, "skipped", reason=reason)
+                self.state.mark_agent_run(A.NAME, "skipped", 0.0,
+                                           reason=reason)
+                continue
+            self._run_one_agent(A, self.state, ui)
+        # Per-sub loop of the repeated ones
+        for i, host_pri in enumerate(final_queue):
+            self._loop_repeated_agents_on_sub(
+                host_pri=host_pri, repeated_names=repeated_names,
+                ui=ui, index=i, total=len(final_queue))
+        # Phase 3: report
+        for A in remaining:
+            if A is ReportAgent:
+                self._run_one_agent(A, self.state, ui)
+                break
 
     # ── multi-host pipeline ─────────────────────────────────────────
     def _run_multi_host(self, mh_cfg: dict, ui) -> None:
@@ -421,17 +573,17 @@ class Orchestrator:
         # "Suggested Additional Targets" section instead of being scanned
         # automatically.
         #
-        # Before this fix, sub_prioritizer's top-ranked sub (e.g. a cpanel
-        # host promoted to score 56 while the actual WP host `www` ranked
-        # 33) became the ONLY attack target — every downstream agent
-        # scanned the wrong host for 55+ min while the target the operator
-        # asked for got zero coverage. Symptoms seen in a real run:
+        # Before this fix, sub_prioritizer's top-ranked sub (e.g. cpanel
+        # promoted to score 56 while the actual WP host www ranked 33)
+        # became the ONLY attack target — every downstream agent scanned
+        # cpanel for 55+ min while the target the operator asked for got
+        # zero coverage. Root cause seen in run 20260903T175056Z:
         #
-        #   - wpscan ran against `cpanel.<target>` (which isn't WordPress).
+        #   - wpscan ran against a cPanel host (not WordPress).
         #   - web_vuln nuclei ran with `-tags cve,nginx` against a cPanel
         #     host that doesn't run nginx.
         #   - content_discovery crawled `cpanel?locale=xx` → 31 dupes.
-        #   - `www.<target>` (the operator's actual target) never scanned
+        #   - the actual target the operator asked for was never scanned
         #     in Phase 2 despite being in state.live_hosts.
         #
         # New behaviour:

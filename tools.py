@@ -638,6 +638,50 @@ class ToolRegistry:
         low = command.lower().strip()
         if not low.startswith("nuclei"):
             return ""
+        # PN15 iter 9 (2026-09-04): detect `-tags "Apache HTTP Server"` /
+        # `-tags cve,apache http server` — the LLM sometimes copies a
+        # display name (from fingerprint) into `-tags` without kebab-case
+        # normalizing it. Nuclei then either (a) sees multiple positional
+        # args instead of one tag list, or (b) matches nothing because
+        # the actual template tag is `apache-http-server`. Either way,
+        # scan budget burnt for 0 hits. Detect by shlex-parsing and
+        # counting non-flag tokens right after `-tags` — 2+ = space bug.
+        import shlex as _shlex
+        try:
+            toks = _shlex.split(command)
+        except ValueError:
+            toks = []
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t in ("-tags", "--tags") and i + 1 < len(toks):
+                extras: list[str] = []
+                j = i + 1
+                while j < len(toks) and not toks[j].startswith("-"):
+                    extras.append(toks[j])
+                    j += 1
+                if len(extras) > 1:
+                    joined = " ".join(extras)
+                    return (f"ERROR: nuclei -tags received multiple "
+                            f"space-separated tokens ({joined!r}). Nuclei "
+                            f"expects one kebab-case slug or a comma-"
+                            f"joined list — NO spaces. Convert display "
+                            f"names to slugs: 'Apache HTTP Server' → "
+                            f"'apache-http-server', 'Google Tag Manager' → "
+                            f"'google-tag-manager', 'jQuery Migrate' → "
+                            f"'jquery-migrate'. Also strip any `:version` "
+                            f"suffix (`php:8.4.24` → `php`). Retry with "
+                            f"the normalised tag(s).")
+                i = j
+                continue
+            if t.startswith(("-tags=", "--tags=")) and " " in t:
+                bad = t.split("=", 1)[1]
+                return (f"ERROR: nuclei -tags= value {bad!r} contains a "
+                        f"space. Nuclei tag names are kebab-case slugs — "
+                        f"no spaces. Convert 'Apache HTTP Server' → "
+                        f"'apache-http-server'. Retry with the "
+                        f"normalised tag.")
+            i += 1
         # Extract the value of -tags <val> or --tags <val>
         import re as _re
         m = _re.search(r"(?:-tags|--tags)[= ]+([\w,\-.]+)", low)

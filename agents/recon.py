@@ -67,10 +67,25 @@ Rules:
                 f"Do NOT loop trying subfinder variants — it will never work "
                 f"on localhost/IP."
             )
+        # PN-tool-precheck iter 9 (2026-09-04): if the harness already
+        # detected certain optional tools as missing, tell the LLM so
+        # it doesn't waste turns on `exit=127`.
+        missing = state.get("missing_tools") or []
+        missing_note = ""
+        _RECON_TOOLS = {"naabu", "amass", "assetfinder", "chaos-client"}
+        recon_missing = [t for t in missing if t in _RECON_TOOLS]
+        if recon_missing:
+            missing_note = (
+                f"\nTools NOT installed on this host (DO NOT try them "
+                f"— exit=127 wastes a turn): {', '.join(recon_missing)}. "
+                f"Use the tools that ARE installed: subfinder, dnsx, "
+                f"httpx, gau, waybackurls, katana.\n"
+            )
         return (
             f"Target: {target}\n"
             f"Apex domain: {apex}\n"
-            f"In-scope hostnames/patterns: {in_scope}\n\n"
+            f"In-scope hostnames/patterns: {in_scope}"
+            f"{missing_note}\n"
             "Enumerate subdomains + live HTTP hosts + open ports. "
             "Finish when you have a live-hosts list."
         )
