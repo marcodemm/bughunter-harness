@@ -570,8 +570,13 @@ class ReportAgent(BaseAgent):
                 while len(parts) < 5:
                     parts.append(0)
                 return tuple(parts)
+            # PN17 iter 10: alias-resolve so `version_by_css:7.0.4` gets
+            # sanity-checked as `wordpress:7.0.4` — otherwise the check
+            # never fires on nuclei-detector-named techs.
+            from tech_aliases import resolve_tech_alias
             _implausible: list[str] = []
             for t in _techs:
+                t = resolve_tech_alias(t)
                 if ":" not in t:
                     continue
                 name, _, ver = t.partition(":")
@@ -695,15 +700,22 @@ class ReportAgent(BaseAgent):
 
 
 def _dedup_techs_for_display(raw: list) -> list[str]:
-    """Global dedup for the `Techs detected` line — PN7 restore iter 8.
+    """Global dedup for the `Techs detected` line — PN7 restore iter 8,
+    PN17 alias-aware iter 10.
 
     Multiple agents contribute to `state.detected_techs` from different
     vocabularies:
       recon httpx-python  → 'Google Tag Manager' (display form)
       fingerprint nuclei  → 'google-tag-manager' (slug form)
       wpscan JSON parser  → 'wordpress:7.1'      (version-tagged form)
+      nuclei detector alias → 'version_by_css:7.0.4' (detector name, not tech)
 
-    Without dedup the header carries all three forms of the same tech.
+    Without dedup the header carries all forms of the same tech. Iter 10
+    additionally passes every entry through the alias table so a
+    detector-named tech (`version_by_css`, `favicon-detect:plesk`) is
+    collapsed onto its canonical product name and the operator sees
+    `wordpress:7.0.4` in the header instead of `version_by_css:7.0.4`.
+
     Key = lowercased slug with hyphens normalized to spaces and any
     `:version` suffix stripped. For each key keep the form with most
     signal: prefer version-tagged, else display form, else raw slug.
@@ -711,6 +723,10 @@ def _dedup_techs_for_display(raw: list) -> list[str]:
     """
     if not raw:
         return []
+    # PN17: alias-resolve first so `version_by_css:7.0.4` collapses onto
+    # `wordpress:7.0.4` before dedup.
+    from tech_aliases import resolve_tech_alias
+    raw = [resolve_tech_alias(t) for t in raw]
 
     def _key(t: str) -> str:
         base = str(t).lower().split(":", 1)[0]

@@ -60,10 +60,25 @@ class SharedState:
             return json.loads(json.dumps(self._data))
 
     def has_tech(self, name: str) -> bool:
-        """Case-insensitive substring match against detected_techs."""
+        """Case-insensitive substring match against detected_techs.
+
+        PN17 iter 10 (2026-09-04): the raw list can contain nuclei detector
+        template names that aren't the tech's canonical name (e.g.
+        `version_by_css:7.0.4` for WordPress). Resolve every entry through
+        the alias table before matching, so `has_tech("wordpress")` returns
+        True whether the entry is `wordpress:7.0.4` OR `version_by_css:7.0.4`
+        OR `wordpress-detect:wp-json`. Without this the wordpress agent
+        skipped WordPress-obvious targets."""
+        from tech_aliases import resolve_tech_alias
         name = name.lower()
         with self._lock:
-            return any(name in str(t).lower() for t in self._data["detected_techs"])
+            for t in self._data["detected_techs"]:
+                s = str(t).lower()
+                if name in s:
+                    return True
+                if name in resolve_tech_alias(s):
+                    return True
+        return False
 
     def has_live_http(self) -> bool:
         """True if the target OR any discovered live_host is HTTP/HTTPS."""

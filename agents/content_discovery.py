@@ -94,6 +94,22 @@ Rules:
         # `.../(?:.+/)?feed(?:/(?:.+/?)?)?$|/(?:.+/)?embed/...`).
         _BAD_URL_MARKERS = ("(?:", "?:", "\\n", "%5cn", "|/", "\\.",
                              "%e2%96%ba")
+        # PN19 iter 10 (2026-09-04): the LLM commonly invokes
+        # `ffuf -u https://x/FUZZ -w wordlist.txt` and the URL with the
+        # placeholder ends up in stdout/log — parsed as an endpoint. The
+        # /FUZZ endpoint then pollutes `endpoints_found` (HEAD-probes
+        # 301, listed for the operator to open — dead lead). Same for
+        # other common LLM/tool placeholders. Uses a boundary-anchored
+        # regex to avoid false positives on real paths (e.g. `/fuzz`
+        # must not eat `/fuzzy-search`, `/target.com/` must be a
+        # placeholder, not a real target). Case-insensitive.
+        _PLACEHOLDER_RE = re.compile(
+            r"/(?:FUZZ|BASEURL|PLACEHOLDER|HOST|"
+            r"\{\{[^/]*\}\}|<[^/>]+>|"
+            r"example\.com|target\.com|domain\.com)"
+            r"(?:[/?#]|$)",
+            re.IGNORECASE,
+        )
 
         def _is_valid_url(u: str) -> bool:
             if not u or not (u.startswith("http://")
@@ -107,6 +123,9 @@ Rules:
                 return False
             u_low = u.lower()
             if any(m in u_low for m in _BAD_URL_MARKERS):
+                return False
+            # PN19: reject URLs still carrying an ffuf/tool placeholder
+            if _PLACEHOLDER_RE.search(u):
                 return False
             if p.path and len(p.path) > 1:
                 # Path que empieza por metachar regex tras el `/`

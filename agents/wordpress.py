@@ -99,7 +99,51 @@ Rules:
 """
 
     def entry_condition(self, state) -> bool:
-        return state.has_tech("wordpress") or state.has_tech("wp-")
+        """PN18 iter 10 (2026-09-04): 4-signal entry so a WordPress-
+        obvious target actually triggers the agent. Old form was
+        `state.has_tech("wordpress")` alone — literal-substring match
+        against the raw tech list. When nuclei's `wordpress-detect:
+        version_by_css` detector fires, the raw list carries
+        `version_by_css:7.0.4` (the DETECTOR name, not `wordpress`) →
+        old check returned False → wordpress agent skipped even though
+        `/wp-admin/install.php` sat in endpoints and fingerprint's
+        narrative said 'running WordPress 7.0.4 with Elementor Pro
+        3.20.0'. Signal 1 (has_tech) now applies the alias table via
+        shared_state; signals 2-4 catch the case even if signal 1 miss.
+        """
+        # Signal 1: direct tech detection (alias-resolved inside has_tech)
+        if state.has_tech("wordpress") or state.has_tech("wp-"):
+            return True
+        # Signal 2: any endpoint whose path matches a WordPress marker
+        import re as _re
+        _WP_PATH = _re.compile(r"/wp-(admin|content|includes|json|login)",
+                                _re.IGNORECASE)
+        for e in (state.get("endpoints_found") or []):
+            url = str(e.get("url", ""))
+            if _WP_PATH.search(url):
+                return True
+        for e in (state.get("endpoints_probed_negative") or []):
+            url = str(e.get("url", ""))
+            if _WP_PATH.search(url):
+                return True
+        # Signal 3: fingerprint agent's narrative summary mentions
+        # `wordpress` literally (LLM told us so)
+        for sm in (state.get("agent_summaries") or []):
+            if str(sm.get("agent", "")) != "fingerprint":
+                continue
+            if "wordpress" in str(sm.get("summary", "")).lower():
+                return True
+        # Signal 4: any finding whose evidence carries `wordpress-detect`
+        # or `wp-content/plugins` — these strings only appear in nuclei
+        # WordPress-family template output or WP asset URLs.
+        for f in (state.get("findings") or []):
+            ev = str(f.get("evidence", "")).lower()
+            if "wordpress-detect" in ev or "wp-content/plugins" in ev:
+                return True
+            title = str(f.get("title", "")).lower()
+            if "wordpress" in title:
+                return True
+        return False
 
     def build_objective(self, state) -> str:
         host = _target_with_wp_evidence(state)

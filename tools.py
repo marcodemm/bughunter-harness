@@ -31,6 +31,10 @@ SHELL_HELPERS = {
     "grep", "egrep", "fgrep", "awk", "cut", "tr", "sed",
     "tee", "xargs", "find", "which", "file", "echo",
     "base64", "jq", "yq",
+    # PN20 iter 10 (2026-09-04): POSIX-safe read-only builtins the LLM
+    # commonly used and hit the allowlist wall (`pwd`, `command -v`,
+    # `printf`, `test`). None mutate state; all are safe helpers.
+    "pwd", "command", "type", "test", "printf",
 }
 
 # Hard-forbidden PLAIN SUBSTRINGS anywhere in the full command line. These
