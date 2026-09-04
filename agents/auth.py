@@ -229,7 +229,6 @@ def _wp_user_enum(state, agent_name: str, entry: dict, result: str) -> None:
     if "/wp-json/wp/v2/users" not in signature and \
        "/?author=" not in signature:
         return
-    body_low = result.lower()
     # Signature 1: JSON array response `[{"id":<n>,"slug":"…"}]` — WP
     # REST returns this for /wp-json/wp/v2/users when unauth-readable.
     import re as _re
@@ -256,35 +255,98 @@ def _wp_user_enum(state, agent_name: str, entry: dict, result: str) -> None:
     # Extract target host from url_arg or cmd
     _url = _re.search(r"https?://[^\s\"'<>]+", url_arg + " " + cmd)
     target = _url.group(0) if _url else _primary_url(state)
+
+    # PN23 iter 15 (2026-09-05): distinguish two cases that used to be
+    # collapsed under one INFO finding:
+    #   (a) TRUE CVE-2023-5561 — the JSON response carries an explicit
+    #       `"email":"user@host"` field. Fix WP 6.4.1 was NOT applied
+    #       OR a plugin re-exposes the field. Real MEDIUM severity.
+    #   (b) Gravatar-hash + slug-leak — the JSON has NO `email` field
+    #       but `avatar_urls` carry the Gravatar SHA-256 of the email
+    #       (WordPress default). Combined with the `slug` (which is
+    #       created from the username, often the email itself), an
+    #       attacker can reverse the hash offline against a wordlist of
+    #       common corporate email prefixes and confirm the real email
+    #       in <5 seconds. WordPress considers this by-design; strictly
+    #       INFO, but worth surfacing with the gravatar hashes captured.
+    emails_leaked = _re.findall(r'"email"\s*:\s*"([^"]+@[^"]+)"', result)
+    gravatar_hashes = list(dict.fromkeys(
+        _re.findall(r"gravatar\.com/avatar/([a-f0-9]{32,64})", result,
+                     _re.IGNORECASE)))
     slugs = ", ".join(u["slug"] for u in users[:5])
     more = f" +{len(users)-5} more" if len(users) > 5 else ""
-    title = (f"WordPress REST API information disclosure: "
-              f"/wp-json/wp/v2/users publicly readable ({len(users)} "
-              f"user(s) exposed: {slugs}{more})")
-    # Idempotent — skip if already emitted (LLM's finish() may have)
+
+    # Idempotent — skip if already emitted (LLM's finish() may have,
+    # OR this function on a prior transcript entry).
     existing = state.get("findings", []) or []
     for f in existing:
-        if "wp-json/wp/v2/users publicly readable" in str(
-                f.get("title", "")).lower():
+        t = str(f.get("title", "")).lower()
+        if ("wp-json/wp/v2/users" in t
+                or "wordpress rest api" in t):
             return
-    state.add_finding(
-        agent=agent_name, severity="info",
-        title=title[:200],
-        evidence=(f"{target} → {len(users)} user record(s). Slugs: "
-                   f"{slugs}{more}. Full response snippet: "
-                   f"{result[:400].strip()}"),
-        recommendation=(
-            "WordPress exposes the users array on `/wp-json/wp/v2/users` "
-            "and via `/?author=<id>` redirects by default. Impact on its "
-            "own is Info — but each slug is a valid login username, so "
-            "the endpoint hands attackers a user list for follow-on "
-            "brute-force / password-spray against wp-login.php or the "
-            "XML-RPC endpoint. Mitigation: filter `rest_endpoints` for "
-            "the `wp/v2/users` route (disable unauth access) OR install "
-            "a security plugin (Wordfence, iThemes) that blocks the "
-            "endpoint by default. Also disable pretty-permalink author "
-            "redirects if not used."),
-    )
+
+    if emails_leaked:
+        # Case (a) — real CVE-2023-5561
+        email_preview = ", ".join(list(dict.fromkeys(emails_leaked))[:5])
+        state.add_finding(
+            agent=agent_name, severity="medium",
+            title=(f"WordPress REST API email disclosure (CVE-2023-5561): "
+                    f"/wp-json/wp/v2/users returns {len(users)} user(s) "
+                    f"WITH `email` field populated — {email_preview}")[:200],
+            evidence=(f"{target} — {len(users)} user record(s) with real "
+                       f"emails exposed. Emails: {email_preview}. Slugs: "
+                       f"{slugs}{more}. Response snippet: "
+                       f"{result[:400].strip()}"),
+            recommendation=(
+                "Real CVE-2023-5561: fixed in WordPress 6.4.1 by hiding "
+                "the `email` field in the public REST response. Either "
+                "the WP core is < 6.4.1, OR a plugin (or custom "
+                "functions.php filter) re-exposes the field. Upgrade WP "
+                "to latest AND audit `rest_prepare_user` filter usage in "
+                "the codebase. Mitigation while fixing: block the "
+                "endpoint entirely (Wordfence 'Disable WP REST API user "
+                "enumeration' toggle) OR filter `rest_endpoints` for the "
+                "`wp/v2/users` route."),
+        )
+    else:
+        # Case (b) — gravatar-hash + slug leak (WP by-design, INFO)
+        gv_note = ""
+        if gravatar_hashes:
+            first = gravatar_hashes[0]
+            gv_note = (f" Gravatar SHA-256 hash captured ({first[:12]}…) — "
+                        f"reversible offline against a wordlist of common "
+                        f"corporate email prefixes (`info@`, `admin@`, "
+                        f"`contacto@`, `hola@`, `hello@`, `support@`, "
+                        f"`ventas@`, `contact@`) + the target domain in "
+                        f"<5s.")
+        state.add_finding(
+            agent=agent_name, severity="info",
+            title=(f"WordPress REST API user enum + gravatar hash leak: "
+                    f"/wp-json/wp/v2/users returns {len(users)} user(s) "
+                    f"({slugs}{more})")[:200],
+            evidence=(f"{target} — {len(users)} user record(s), NO `email` "
+                       f"field (WP 6.4.1+ fix applied). Slugs: {slugs}"
+                       f"{more}. Gravatar SHA-256 hash(es): "
+                       f"{', '.join(gravatar_hashes[:3]) or '(none)'}. "
+                       f"Response snippet: {result[:400].strip()}"),
+            recommendation=(
+                "WordPress exposes the users array on `/wp-json/wp/v2/"
+                "users` and via `/?author=<id>` redirects by default. "
+                "Impact on its own is Info — but (1) each slug is a "
+                "valid login username, and (2) the `avatar_urls` field "
+                "carries the Gravatar SHA-256 of the user's email, "
+                "reversible offline against a small wordlist of common "
+                "corporate email prefixes.")
+            + gv_note
+            + " Mitigation: filter `rest_endpoints` for `wp/v2/users` "
+              "OR install a security plugin (Wordfence 'Disable WP REST "
+              "API user enumeration'). Also disable pretty-permalink "
+              "author redirects if not used.",
+        )
+        # Publish the raw hashes to state so a downstream agent (or the
+        # operator) can reverse them offline.
+        if gravatar_hashes:
+            state.set("wp_gravatar_hashes", gravatar_hashes)
 
 
 def _primary_url(state):
