@@ -455,6 +455,34 @@ def _parse_wpscan_json_to_findings(state, agent_name: str,
             })
             vulns = p.get("vulnerabilities") or []
             if not vulns:
+                # PN13 diagnostic iter 8 (2026-09-04): the wpscan output
+                # can carry `vulnerabilities: []` for a confirmed plugin
+                # for three separate reasons — no CVE in WPScan DB for
+                # ANY version of the plugin (rare, but genuine — dead
+                # plugins that no one audited), the WPScan API quota was
+                # exhausted mid-file so the field wasn't populated, or
+                # the file being parsed was the OTHER `harness-wpscan*.
+                # json` (the pre-`--enumerate` basic run without vulns
+                # payload). Iter 7 lost CVEs for gdpr-cookie-compliance,
+                # sassy-social-share, table-of-contents-plus this way —
+                # brave-popup-builder kept its 8 CVEs, so this is
+                # per-plugin variability of the wpscan API. Log which
+                # file this came from + whether the API-quota flag is
+                # set so the next run tells us the cause without
+                # re-reading the JSON manually.
+                _quota = "exhausted" if state.get(
+                    "wpscan_api_exhausted") else "ok"
+                state.log(agent_name, "info",
+                           f"wpscan: plugin '{slug}' confirmed via "
+                           f"{source} v{resolved_ver} — but "
+                           f"vulnerabilities:[] in {path.name} "
+                           f"(WPScan API quota: {_quota}). Possible "
+                           f"causes: (a) no CVE known for this plugin "
+                           f"in WPScan DB, (b) file is the basic-scan "
+                           f"variant without the vulns payload, "
+                           f"(c) API quota hit mid-file. If plugin has "
+                           f"known CVEs elsewhere and this is (b) or "
+                           f"(c), re-run with a fresh API token.")
                 state.add_finding(
                     agent=agent_name, severity="info",
                     title=f"WordPress plugin enumerated: {slug} "
@@ -536,9 +564,24 @@ def _emit_wpscan_finding(state, agent_name: str, kind: str, slug: str,
         evidence=ev,
         recommendation=rec,
     )
-    if severity in ("high", "critical"):
+    # CVE counter iter 8 fix (2026-09-04): append to cves_matched whenever
+    # the finding carries a real CVE-id, regardless of severity. WPScan's
+    # `cvss.score` field is None for many older CVEs → severity falls back
+    # to `info` → the CVE would never reach the counter under the old
+    # `severity in high/critical` gate. Iter 7 header said "CVE matches: 0"
+    # while the body listed 8 brave-popup-builder CVEs — exactly this bug.
+    # For non-CVE severity-flagged findings, keep the previous behaviour
+    # so the counter still reflects them (uses a synthetic WPVULN: id).
+    if cves:
         state.append("cves_matched", {
-            "cve": cves[0] if cves else f"WPVULN:{slug}:{title[:40]}",
+            "cve": (str(cves[0]) if str(cves[0]).startswith("CVE-")
+                    else f"CVE-{cves[0]}"),
+            "target": target,
+            "evidence": ev,
+        })
+    elif severity in ("high", "critical"):
+        state.append("cves_matched", {
+            "cve": f"WPVULN:{slug}:{title[:40]}",
             "target": target,
             "evidence": ev,
         })

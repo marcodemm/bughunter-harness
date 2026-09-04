@@ -619,9 +619,22 @@ class ToolRegistry:
     def maybe_reject_nuclei_scan(self, command: str) -> str:
         """Return an ERROR reason string if this command is a `nuclei -tags
         cve,<blocked>` scan, else empty string. Called from `_shell` before
-        execution. Only fires when `cve` is in the tags AND at least one
-        non-scannable tech is combined with it — plain `-tags <tech>`
-        without `cve` is allowed (some tech-detect templates are useful)."""
+        execution. Fires under two conditions:
+
+        (a) `cve` is combined with at least one non-scannable tech (CDN /
+            tracker / frontend lib — see `_NUCLEI_NON_SCANNABLE_TAGS`).
+        (b) PN9 refuerzo iter 8 (2026-09-04): `cve` is combined with MORE
+            THAN 3 tech tags. Iter 7 saw the LLM emit
+              `-tags cve,joomla,drupal,magento,adminer,nginx,apache,iis,
+                    tomcat,jboss,weblogic,spring,symfony,laravel,django,
+                    rails,express,nodejs,portainer,traefik,minio,elasti…`
+            (26+ frameworks) against a WordPress+PHP target — pure
+            scan-everything panic that burnt ~5 min for 0 findings. If
+            the LLM combines `cve` with more than 3 techs, it's ruse-fire,
+            not targeted enumeration → reject with a hint to narrow down.
+
+        Plain `-tags <tech>` without `cve` is always allowed (some tech-
+        detect templates are legitimately broad)."""
         low = command.lower().strip()
         if not low.startswith("nuclei"):
             return ""
@@ -633,15 +646,32 @@ class ToolRegistry:
         tags = set(t.strip() for t in m.group(1).split(","))
         if "cve" not in tags:
             return ""
+        # (a) blocked-list gate
         blocked = tags & self._NUCLEI_NON_SCANNABLE_TAGS
-        if not blocked:
-            return ""
-        blocked_str = ", ".join(sorted(blocked))
-        return (f"ERROR: nuclei -tags cve,{blocked_str} rejected — "
-                f"{blocked_str} has no server-side CVE templates in "
-                f"nuclei-templates (CDN/tracker/frontend lib). Waste of "
-                f"scan budget. Move to a different tech or drop the `cve` "
-                f"tag if you only want tech-detect templates.")
+        if blocked:
+            blocked_str = ", ".join(sorted(blocked))
+            return (f"ERROR: nuclei -tags cve,{blocked_str} rejected — "
+                    f"{blocked_str} has no server-side CVE templates in "
+                    f"nuclei-templates (CDN/tracker/frontend lib). Waste of "
+                    f"scan budget. Move to a different tech or drop the `cve` "
+                    f"tag if you only want tech-detect templates.")
+        # (b) broad-combination gate — PN9 refuerzo iter 8 (2026-09-04).
+        # "cve" itself doesn't count as a tech tag; only the non-cve tags
+        # are counted for the threshold.
+        tech_tags = tags - {"cve"}
+        if len(tech_tags) > 3:
+            preview = ", ".join(sorted(tech_tags)[:6])
+            more = (f" (+{len(tech_tags) - 6} more)"
+                    if len(tech_tags) > 6 else "")
+            return (f"ERROR: nuclei -tags cve combined with {len(tech_tags)} "
+                    f"tech tags ({preview}{more}) rejected — combining `cve` "
+                    f"with more than 3 tech tags is a scan-everything panic, "
+                    f"not targeted enumeration. Nuclei loads a template set "
+                    f"per tag; combining 26 frameworks against one target "
+                    f"burns budget for near-zero hit rate. Narrow to the "
+                    f"1-3 techs that actually fingerprint on this target "
+                    f"(see 'Techs detected' in the user message).")
+        return ""
 
     def maybe_inject_headers(self, command: str) -> tuple[str, str]:
         """Return (new_command, note). If custom_headers apply to any

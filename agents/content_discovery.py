@@ -172,20 +172,75 @@ Rules:
                 return True
             return False
 
-        for entry in transcript:
-            result = str(entry.get("result", ""))
-            for m in re.finditer(r"https?://[^\s\"'<>]+", result):
+        def _harvest_urls_from_text(text: str) -> None:
+            for m in re.finditer(r"https?://[^\s\"'<>]+", text):
                 u = m.group(0).rstrip(".,;:'\"")  # trim trailing punctuation
                 if not _is_valid_url(u):
-                    dropped_invalid += 1
+                    nonlocal_stats["invalid"] += 1
                     continue
                 if _looks_truncated(u):
-                    dropped_truncated += 1
+                    nonlocal_stats["truncated"] += 1
                     continue
                 if _in_scope(u):
                     found.add(u)
                 else:
-                    dropped_off_scope += 1
+                    nonlocal_stats["off_scope"] += 1
+
+        # Wrap mutable counters so the nested helper can update them.
+        nonlocal_stats = {"invalid": 0, "truncated": 0, "off_scope": 0}
+        for entry in transcript:
+            _harvest_urls_from_text(str(entry.get("result", "")))
+
+        # PN12 fix (2026-09-04): the LLM commonly redirects `gau`/`waybackurls`
+        # output to a temp file with `> /tmp/gau.txt` and then only shows
+        # `wc -l /tmp/gau.txt` in the shell result — stdout carries just
+        # "3 /tmp/gau.txt", zero URLs, so the transcript scan above sees
+        # nothing to harvest. Iter 7 run 20260904T063504Z lost all endpoints
+        # to this class of bug (Endpoints=0). Fix: after the transcript scan,
+        # also read the temp files the LLM created and harvest URLs from them.
+        # Uses a conservative glob list to avoid pulling in wordlists or the
+        # harness's own JSONL sinks.
+        from pathlib import Path as _P
+        tmp = _P("/tmp")
+        if tmp.is_dir():
+            _URL_TMP_GLOBS = (
+                "gau*.txt", "target_gau*.txt", "wayback*.txt",
+                "harness-gau*.txt", "harness-wayback*.txt",
+                "harness-katana*.txt", "katana*.txt", "hakrawler*.txt",
+                "harness-content*.txt", "urls*.txt", "endpoints*.txt",
+            )
+            _files_read = 0
+            _bytes_read = 0
+            _MAX_FILES = 12
+            _MAX_BYTES = 4 * 1024 * 1024  # 4 MB safety cap
+            for pattern in _URL_TMP_GLOBS:
+                for path in sorted(tmp.glob(pattern)):
+                    if _files_read >= _MAX_FILES:
+                        break
+                    try:
+                        size = path.stat().st_size
+                    except Exception:
+                        continue
+                    if size < 2 or _bytes_read + size > _MAX_BYTES:
+                        continue
+                    try:
+                        with open(path, "r", encoding="utf-8",
+                                   errors="ignore") as fh:
+                            _harvest_urls_from_text(fh.read())
+                    except Exception:
+                        continue
+                    _files_read += 1
+                    _bytes_read += size
+            if _files_read:
+                state.log(self.NAME, "info",
+                           f"PN12 fallback: harvested URLs from "
+                           f"{_files_read} temp file(s) ({_bytes_read} bytes) "
+                           f"— LLM redirected tool output to disk instead "
+                           f"of stdout, so transcript scan missed them")
+
+        dropped_invalid = nonlocal_stats["invalid"]
+        dropped_truncated = nonlocal_stats["truncated"]
+        dropped_off_scope = nonlocal_stats["off_scope"]
         if dropped_truncated:
             state.log(self.NAME, "info",
                       f"dropped {dropped_truncated} truncated URLs "
