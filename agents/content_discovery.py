@@ -53,6 +53,23 @@ Rules:
   - If a session cookie is available, ALWAYS pass it to katana + ffuf so
     the crawl discovers post-login endpoints (DVWA /vulnerabilities/*, WP
     /wp-admin/*, etc.). This is the difference between 0 and 20+ findings.
+
+SHELL SYNTAX — CRITICAL (repeated denylist violations kill turn budget):
+  The harness's shell denylist is HARD. It BLOCKS `&&`, `&`, `$(...)`,
+  backticks, and pipe backgrounding. Every violation returns:
+    `ERROR: forbidden token '&' in command (hard denylist — no bypass)`
+  and wastes a turn. If you get one of these errors, DO NOT retry with
+  the same pattern — SWITCH to the sequential form on the next turn:
+    WRONG:  wc -l /tmp/x.txt && head -30 /tmp/x.txt
+    RIGHT:  wc -l /tmp/x.txt ; head -30 /tmp/x.txt
+    WRONG:  gau target.com > /tmp/x.txt && wc -l /tmp/x.txt
+    RIGHT:  gau target.com > /tmp/x.txt ; wc -l /tmp/x.txt
+    WRONG:  cat /tmp/x.txt | awk ... > /tmp/y.txt && cat /tmp/y.txt
+    RIGHT:  cat /tmp/x.txt | awk ... > /tmp/y.txt ; cat /tmp/y.txt
+  Pipes (|), semicolons (;) and redirects (>, >>, 2>&1) all work. Only
+  the boolean operators (&&, ||) and command substitution ($(), ``) are
+  blocked. If you catch yourself typing `&&`, replace with `;` before
+  hitting send.
 """
 
     def entry_condition(self, state) -> bool:

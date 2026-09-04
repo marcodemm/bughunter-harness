@@ -636,6 +636,34 @@ class ReportAgent(BaseAgent):
                     "(free, no quota, always available). Top up at "
                     "<https://account.shodan.io> or wait for the monthly "
                     "reset.")
+            # (k) PN20 iter 11 (2026-09-04): wpscan JSON output empty
+            # despite wpscan being called. Likely target-connection
+            # failure or wpscan aborted pre-write.
+            if s.get("wpscan_output_empty"):
+                _meta_warnings.append(
+                    "**wpscan ran but produced NO parseable JSON output**. "
+                    "Every wpscan call errored before writing the file, or "
+                    "the shell wrapper truncated the write. Check the "
+                    "`### wordpress` per-agent Tool Activity for exit codes "
+                    "on the wpscan calls — a `429` / `403` / `exit=4` "
+                    "usually points at rate-limiting or WAF; a `timeout` "
+                    "points at a hung wpscan process. Re-run manually "
+                    "with `--verbose --debug` to inspect.")
+            # (l) PN20 iter 11: wpscan JSON files exist AND non-empty
+            # but parser found 0 plugin/theme/core CVEs.
+            if s.get("wpscan_zero_findings"):
+                _meta_warnings.append(
+                    "**wpscan JSON output parsed but produced 0 CVE "
+                    "findings**. Either the target genuinely has no "
+                    "plugins/themes with known CVEs in the WPScan DB, "
+                    "or the JSON shape diverged from the parser. Sanity "
+                    "check manually: `cat /tmp/harness-wpscan-full.json "
+                    "| jq '.plugins | keys'` should list the plugin "
+                    "slugs — if that returns empty or errors, wpscan "
+                    "itself didn't detect plugins (probable WAF)."
+                    " If the list is populated but the CVE fields are "
+                    "empty, the WPScan API token may be missing / "
+                    "unauthorised.")
         except Exception:
             pass  # meta-check NEVER breaks the report
 

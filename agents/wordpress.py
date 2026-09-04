@@ -266,12 +266,24 @@ Rules:
         # was near-useless). If /tmp/harness-wpscan*.json exists, iterate
         # every plugin/theme and every vulnerability inside → structured
         # findings with severity mapped from CVSS.
+        wpscan_findings_added = 0
         try:
-            _parse_wpscan_json_to_findings(state, self.NAME,
-                                            "harness-wpscan*.json")
+            wpscan_findings_added = _parse_wpscan_json_to_findings(
+                state, self.NAME, "harness-wpscan*.json")
         except Exception as e:
             state.log(self.NAME, "warn",
                       f"wpscan JSON parse failed: {type(e).__name__}: {e}")
+
+        # PN20 iter 11 (2026-09-04): if wpscan corrió N veces pero el
+        # parser NO añadió findings, el agent está ciego. Diagnóstico
+        # explícito: mira los outputs raw de cada wpscan call, distingue
+        # entre (a) file no existe / size 0 → WAF challenge o network
+        # error, (b) contains quota marker → API exhausted, (c) file OK
+        # pero sin plugins/version → wpscan no reconoció WP en el target.
+        # Publica flags a state para que report.py emita meta-check
+        # warnings específicos por caso.
+        _diagnose_wpscan_empty(state, self.NAME, transcript,
+                                findings_added=wpscan_findings_added)
 
         # Legacy CLI parser kept as fallback for older prompts / --format cli.
         for entry in transcript:
@@ -629,6 +641,112 @@ def _emit_wpscan_finding(state, agent_name: str, kind: str, slug: str,
             "target": target,
             "evidence": ev,
         })
+
+
+def _diagnose_wpscan_empty(state, agent_name: str, transcript,
+                            findings_added: int) -> None:
+    """PN20 iter 11 (2026-09-04): when the wpscan parser adds 0 findings
+    while `wordpress` agent was clearly triggered and wpscan was run
+    multiple times, emit a diagnostic that names the most likely root
+    cause. Pushes flags to state so report.py's meta-check block can
+    surface a specific warning to the operator instead of leaving the
+    silent 0-finding wpscan pass.
+
+    Classification (in order):
+      1. state.wpscan_api_exhausted already set → already covered by
+         existing meta-check "WPScan API daily quota reached"; nothing
+         extra to add.
+      2. Any wpscan output contains "does not seem to be running
+         WordPress" AND fingerprint saw WordPress → WAF challenge is
+         the most probable cause → set wpscan_waf_suspect + log.
+      3. All wpscan output files are missing OR size 0 → shell wrapper
+         may have truncated, or every call errored before producing a
+         file → log.
+      4. Files exist but parser saw 0 plugins/vulns → wpscan received
+         a response but the JSON was empty (target has no plugins that
+         wpscan recognises, or the parser's expected shape mismatched).
+    """
+    if findings_added > 0:
+        return
+    # Any wpscan call attempted at all?
+    wpscan_calls = 0
+    saw_waf_hint = False
+    saw_quota_hint = False
+    for e in transcript:
+        cmd = str(e.get("args", {}).get("command", ""))
+        if "wpscan " not in cmd:
+            continue
+        wpscan_calls += 1
+        result_low = str(e.get("result", "")).lower()
+        if ("does not seem to be running wordpress" in result_low
+                or "target is not a wordpress site" in result_low
+                or "not vulnerable" in result_low):
+            saw_waf_hint = True
+        if ("daily limit" in result_low
+                or "api limit reached" in result_low
+                or "reached the daily" in result_low):
+            saw_quota_hint = True
+    if wpscan_calls == 0:
+        return  # agent skipped wpscan entirely — nothing to diagnose
+
+    # State already carries wpscan_api_exhausted → existing meta-check
+    # covers it.
+    if state.get("wpscan_api_exhausted") or saw_quota_hint:
+        state.set("wpscan_api_exhausted", True)
+        state.log(agent_name, "warn",
+                   f"wpscan JSON parser added 0 findings after "
+                   f"{wpscan_calls} call(s). WPScan API daily quota is "
+                   f"the most likely cause (free tier = 25 req/day). "
+                   f"See existing meta-check warning.")
+        return
+
+    # Fingerprint saw WordPress but wpscan claims 'not WordPress' → WAF.
+    techs = [str(t).lower() for t in state.get("detected_techs", []) or []]
+    from tech_aliases import resolve_tech_alias
+    resolved = [resolve_tech_alias(t) for t in techs]
+    wp_confirmed_elsewhere = any("wordpress" in t for t in resolved)
+    if saw_waf_hint and wp_confirmed_elsewhere:
+        state.set("wpscan_waf_suspect", True)
+        state.log(agent_name, "warn",
+                   f"wpscan returned 'not a WordPress site' on {wpscan_calls} "
+                   f"call(s) while fingerprint confirmed WordPress. Almost "
+                   f"certainly a WAF (ModSecurity / Cloudflare / DataDome) "
+                   f"blocking wpscan's fingerprint requests. See meta-check "
+                   f"warning + suggested remediations in REPORT.")
+        return
+
+    # Files missing or empty — parser had nothing to eat.
+    from pathlib import Path as _P
+    tmp = _P("/tmp")
+    wpscan_files = list(tmp.glob("harness-wpscan*.json")) if tmp.is_dir() else []
+    empty_or_missing = 0
+    for p in wpscan_files:
+        try:
+            if p.stat().st_size < 10:
+                empty_or_missing += 1
+        except Exception:
+            empty_or_missing += 1
+    if not wpscan_files or empty_or_missing == len(wpscan_files):
+        state.set("wpscan_output_empty", True)
+        state.log(agent_name, "warn",
+                   f"wpscan ran {wpscan_calls} time(s) but produced NO "
+                   f"parseable JSON output ({len(wpscan_files)} file(s), "
+                   f"{empty_or_missing} empty). Every call may have errored "
+                   f"pre-write. Check the per-agent Tool Activity for exit "
+                   f"codes and stderr of the individual calls.")
+        return
+
+    # Files exist + non-empty but parser hit 0 findings. Could be
+    # (a) target has no plugins wpscan recognises, or (b) JSON shape
+    # unexpected. Emit a generic diagnostic so the operator knows.
+    state.set("wpscan_zero_findings", True)
+    state.log(agent_name, "warn",
+               f"wpscan produced {len(wpscan_files)} JSON file(s) but "
+               f"parser found 0 plugin/theme/core vulnerabilities. Either "
+               f"the target genuinely has no known-CVE items, or the JSON "
+               f"structure diverged from the parser's expectations. Verify "
+               f"manually: `cat /tmp/harness-wpscan-full.json | jq '.plugins "
+               f"| keys'` should list the plugin slugs wpscan detected.")
 
 
 def _target_with_wp_evidence(state):

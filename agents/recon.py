@@ -44,6 +44,14 @@ Rules:
   - Save intermediate output to /tmp/harness-recon-<random>.txt if you need
     to pipe between tools.
   - After 6-8 tool_calls, call finish() with the count of live hosts found.
+
+SHELL SYNTAX — CRITICAL:
+  The shell denylist BLOCKS `&&`, `&`, `$(...)`, backticks. If you see
+    `ERROR: forbidden token '&' in command (hard denylist — no bypass)`
+  the fix is to switch `&&` for `;` on the next turn, not to retry the
+  same command. Pipes (|), semicolons (;), redirects (>, >>, 2>&1) work.
+    WRONG:  cat x.txt && wc -l x.txt
+    RIGHT:  cat x.txt ; wc -l x.txt
 """
 
     def build_objective(self, state) -> str:

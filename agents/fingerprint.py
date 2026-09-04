@@ -706,9 +706,14 @@ Rules:
             deduped.append(d)
 
         # Populate state.detected_techs with ALL techs seen (name only,
-        # lowercase, deduped, ignoring version)
+        # lowercase, deduped, ignoring version). PN17 iter 11 (2026-09-04):
+        # alias-resolve BEFORE storing so `version_by_css` gets stored as
+        # `wordpress`, `favicon-detect:plesk` as `plesk`, etc. Keeps the
+        # raw list clean of detector-template names.
+        from tech_aliases import resolve_tech_alias
         state.extend("detected_techs",
-                      sorted({d["tech"] for d in deduped
+                      sorted({resolve_tech_alias(d["tech"])
+                              for d in deduped
                               if d["tech"] and len(d["tech"]) < 40}))
 
         # Emit one info finding per (tech, version)
@@ -721,7 +726,12 @@ Rules:
         # real matches were on www.
         _url_in_ev_re = re.compile(r"https?://[^\s\[\]()<>\"']+", re.IGNORECASE)
         for d in deduped:
-            tech = d["tech"]
+            # PN17 iter 11 (2026-09-04): alias-resolve the tech name for
+            # the finding title too — `version_by_css 7.0.4 detected on X`
+            # becomes `wordpress 7.0.4 detected on X`, consistent with the
+            # header's `Techs detected:` line. Evidence stays untouched
+            # so the operator can still see which nuclei template fired.
+            tech = resolve_tech_alias(d["tech"])
             version = d["version"]
             source = d["source"]
             ev = d["evidence"]
