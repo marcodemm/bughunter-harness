@@ -183,7 +183,7 @@ At the prompt:
 Objective (one-line goal for the agent). Type /quit or /bye to exit.
 Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH
 Target: bare URL, or --target URL (both work anywhere in the line)
-Example:  --target https://www.domain.com --scope *.domain.com --top-hosts 3 --complete
+Example:  --target https://www.example.com --scope *.example.com --top-hosts 3 --complete
 
 > http://localhost:3000/
 ```

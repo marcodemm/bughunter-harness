@@ -1312,13 +1312,13 @@ def prompt_for_objective(is_first: bool) -> str | None:
                   "Type /quit or /bye to exit.")
             print("Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH")
             print("Target: bare URL, or --target URL (both work anywhere in the line)")
-            print("Example:  --target https://www.domain.com --scope *.domain.com --top-hosts 3 --complete")
+            print("Example:  --target https://www.example.com --scope *.example.com --top-hosts 3 --complete")
         else:
             print("\n─── Previous session ended ───")
             print("New objective (or /quit / /bye to exit).")
             print("Inline flags (sticky): --email ADDR  --scope PAT (repeat)  -o PATH")
             print("Target: bare URL, or --target URL (both work anywhere in the line)")
-            print("Example:  --target https://www.domain.com --scope *.domain.com --top-hosts 3 --complete")
+            print("Example:  --target https://www.example.com --scope *.example.com --top-hosts 3 --complete")
         line = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n[!] Cancelled.")
