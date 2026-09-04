@@ -260,7 +260,7 @@ Everything lives in `config.yaml`. Key sections:
 | `oob_host` | Your self-hosted OOB catcher (for blind vuln PoCs) |
 | `smtp.*` | Email destination (with `default_to` for automatic send) |
 | `telegram.*` | Telegram bot token + chat_id |
-| `notify_only_if_findings` | Only send email + Telegram if run produced findings |
+| `notify_only_if_findings` | Only send email + Telegram if the run produced at least one MEDIUM / HIGH / CRITICAL finding (INFO and LOW alone do not trigger a notification). Default `true`; set to `false` to always send (useful when debugging the pipeline). Same gate applies to email and Telegram. |
 | `cleanup_tempfiles` | Wipe `/tmp/harness-*` etc. after each run |
 | `adversarial_review.*` | Post-pipeline finding gate (see "Adversarial review" below) |
 | `multi_host.*` | Loop scan over top-N ranked subs (see "Multi-host mode" below) |
