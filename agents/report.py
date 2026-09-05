@@ -719,6 +719,40 @@ class ReportAgent(BaseAgent):
                     "(free, no quota, always available). Top up at "
                     "<https://account.shodan.io> or wait for the monthly "
                     "reset.")
+            # (m) Fix A+C iter 16 (2026-09-05): loop detection fired.
+            # BaseAgent tracked the tool-call ring and either warned
+            # the LLM (2× same-command timeout) or force-finished the
+            # agent (3× same-command timeout). Surfacing here so the
+            # operator sees WHY the pipeline ended early on that agent.
+            if s.get("loop_forced_finish"):
+                _agent = s.get("loop_forced_finish_agent") or "?"
+                _cmd = s.get("loop_forced_finish_cmd") or "?"
+                _meta_warnings.append(
+                    f"**Loop detection force-finished the `{_agent}` "
+                    f"agent** — it ran the same shell command 3 times in "
+                    f"a row and all 3 hit the shell timeout (~15 min "
+                    f"each). Command args (truncated): `{_cmd}`. Root "
+                    f"cause is almost always an input file too big for "
+                    f"the tool: e.g. `httpx -l <subs.txt>` where <subs.txt> "
+                    f"has thousands of entries (multi-tenant hosting like "
+                    f"github.io / herokuapp.com / netlify.app — every "
+                    f"tenant becomes a subdomain). Fix: narrow --scope, "
+                    f"or `head -500 <file>` before feeding to httpx, or "
+                    f"grep-filter to interesting prefixes (`admin|api|dev`)."
+                )
+            elif int(s.get("loop_detected_count") or 0) > 0:
+                _n = int(s.get("loop_detected_count") or 0)
+                _meta_warnings.append(
+                    f"**Loop-detection warning triggered {_n} time(s)** — "
+                    f"an agent's LLM was about to retry the same failed "
+                    f"command a 2nd time and the harness injected a "
+                    f"system message to change approach. The LLM listened "
+                    f"and did something different (no forced finish "
+                    f"needed). If you see this often on similar targets, "
+                    f"consider tightening --scope or the wordlist so "
+                    f"httpx/ffuf don't hit the shell timeout in the "
+                    f"first place."
+                )
             # (k) PN20 iter 11 (2026-09-04): wpscan JSON output empty
             # despite wpscan being called. Likely target-connection
             # failure or wpscan aborted pre-write.

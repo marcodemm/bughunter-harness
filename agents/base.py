@@ -439,6 +439,10 @@ class BaseAgent:
         tools = self._filtered_tool_schemas()
         transcript: list[dict] = []
         no_tool_retries = 0
+        # Fix A iter 16 (2026-09-05): ring buffer for loop detection.
+        # Each entry: {"sig": "<tool_name>::<json args truncated>", "timeout": bool}.
+        _tool_call_ring: list[dict] = []
+        _loop_warned_once = False
 
         while self.turns < max_iterations_run:
             self.turns += 1
@@ -547,6 +551,76 @@ class BaseAgent:
                 messages.append({
                     "role": "tool", "tool_call_id": tc.id, "content": red,
                 })
+
+                # Fix A + C iter 16 (2026-09-05): loop detection.
+                # Track a small ring of the last few tool calls. When we
+                # see the same command (same name + args hash) hitting
+                # the same failure class (shell timeout) twice in a row,
+                # inject a system message telling the LLM to change
+                # approach. If it happens 3× in a row → force finish so
+                # the pipeline doesn't burn hours on a hung command.
+                # Trigger observed in real runs: recon LLM re-issued
+                # `httpx -l /tmp/harness-recon-*.txt` 9 times, each 900s
+                # timeout, against a subs list too big to probe in one
+                # shell call.
+                _loop_sig = f"{name}::{json.dumps(args, sort_keys=True)[:400]}"
+                _timeout_hit = ("command timed out" in red.lower()
+                                or "shell_timeout_sec" in red.lower())
+                _tool_call_ring.append({"sig": _loop_sig,
+                                         "timeout": _timeout_hit})
+                # Keep ring short
+                if len(_tool_call_ring) > 5:
+                    _tool_call_ring[:] = _tool_call_ring[-5:]
+                # Warn at 2 identical timeouts
+                if (len(_tool_call_ring) >= 2
+                        and _tool_call_ring[-1]["sig"] == _tool_call_ring[-2]["sig"]
+                        and _tool_call_ring[-1]["timeout"]
+                        and _tool_call_ring[-2]["timeout"]
+                        and not _loop_warned_once):
+                    _loop_warned_once = True
+                    _warn_msg = (
+                        "⚠️ LOOP DETECTED: you've called the same "
+                        f"`{name}` command 2 times in a row and BOTH hit "
+                        "the shell timeout (~15 min each). Do NOT retry the "
+                        "same command a 3rd time — a 3rd retry will force "
+                        "the agent to finish() early. Try a DIFFERENT "
+                        "approach: reduce the input (`head -500 <file>` "
+                        "or `grep -E '^(admin|api|dev|www)'` first), split "
+                        "the workload, use a different tool, or call "
+                        "finish() with what you have.")
+                    messages.append({"role": "system", "content": _warn_msg})
+                    state.log(self.NAME, "warn",
+                               f"loop-detected: same {name} command timed "
+                               f"out 2× — injected retry-warning to LLM.")
+                    state.set("loop_detected_count",
+                               (state.get("loop_detected_count") or 0) + 1)
+                # Force finish at 3 identical timeouts
+                if (len(_tool_call_ring) >= 3
+                        and _tool_call_ring[-1]["sig"] == _tool_call_ring[-2]["sig"] == _tool_call_ring[-3]["sig"]
+                        and all(_tool_call_ring[i]["timeout"]
+                                for i in (-1, -2, -3))):
+                    state.log(self.NAME, "warn",
+                               f"loop-detected: same {name} command timed "
+                               f"out 3× — forcing agent finish.")
+                    state.set("loop_forced_finish", True)
+                    state.set("loop_forced_finish_agent", self.NAME)
+                    state.set("loop_forced_finish_cmd",
+                               str(args)[:200])
+                    self.finish_summary = (
+                        f"Agent {self.NAME} forced to finish() after 3 "
+                        f"consecutive timeouts on the same `{name}` "
+                        f"command. See meta-check warning in REPORT.")
+                    elapsed = time.time() - started
+                    self._process_finish_findings(state)
+                    self.after_run(state, transcript)
+                    self._emit("done", elapsed=elapsed,
+                               tool_calls=self.tool_calls,
+                               turns=self.turns)
+                    state.mark_agent_run(
+                        self.NAME, "done", elapsed,
+                        self.turns, self.tool_calls,
+                        reason="loop-detection: 3× same timeout, forced finish")
+                    return "done"
 
         # loop exit without finish() → treat as done anyway
         elapsed = time.time() - started

@@ -52,6 +52,36 @@ SHELL SYNTAX — CRITICAL:
   same command. Pipes (|), semicolons (;), redirects (>, >>, 2>&1) work.
     WRONG:  cat x.txt && wc -l x.txt
     RIGHT:  cat x.txt ; wc -l x.txt
+
+LARGE-LIST GUARDRAIL — CRITICAL (avoid shell-timeout loops):
+  Before running `httpx -l /tmp/harness-*.txt` (or any other tool that
+  probes every line of a file), CHECK the file size first with `wc -l`.
+  Each httpx probe takes ~1-3 seconds; with the default 15-min shell
+  timeout, ANY input file over ~2000 lines will time out and the shell
+  will kill the process mid-scan. The harness will then detect a loop
+  if you retry (2 identical timeouts → warning, 3 → forced finish).
+
+  Decision table by file size:
+    ≤500 lines   → `httpx -l <file> …` directly.
+    500-2000     → OK but consider `-rl 20 -c 10` to speed it up.
+    2000-10000   → DO NOT feed raw. First filter:
+                     head -500 <file> > /tmp/harness-recon-top500.txt
+                     OR grep -E '^(admin|api|dev|staging|www|mail|
+                       portal|internal|test|beta|preview|stage|qa)' <file>
+                       > /tmp/harness-recon-juicy.txt
+                     Then `httpx -l /tmp/harness-recon-<filtered>.txt`.
+    >10000       → target is a multi-tenant hosting provider (github.io,
+                     herokuapp, appspot, netlify.app, vercel.app,
+                     wordpress.com, blogspot.com, tumblr.com, wixsite.com,
+                     and other SaaS `<tenant>.<provider>.<tld>` platforms)
+                     — do NOT enumerate. call finish() with a
+                     "target is multi-tenant hosting, out of scope" note
+                     so the operator narrows the scope.
+
+  If you see `ERROR: command timed out after 900s.` retry with a
+  DIFFERENT approach (smaller input, filter first) — never retry the
+  exact same command. The harness force-finishes the agent after 3
+  consecutive identical timeouts, so you would waste turns for nothing.
 """
 
     def build_objective(self, state) -> str:
