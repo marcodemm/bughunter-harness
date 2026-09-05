@@ -753,6 +753,25 @@ class ReportAgent(BaseAgent):
                     f"httpx/ffuf don't hit the shell timeout in the "
                     f"first place."
                 )
+            # (n) Fix A iter 17: benign-loop nudge fired — same command
+            # ≥4 times without progress. Not a hang, just LLM
+            # deliberation getting stuck. Info-only.
+            if int(s.get("benign_loop_detected_count") or 0) > 0:
+                _n2 = int(s.get("benign_loop_detected_count") or 0)
+                _meta_warnings.append(
+                    f"**Benign-loop nudge triggered {_n2} time(s)** — "
+                    f"an agent's LLM called the same command with "
+                    f"identical arguments 4 times in a row without "
+                    f"advancing (typically all exit=0, no timeout). The "
+                    f"harness injected a nudge telling the LLM to take "
+                    f"a different action. Common on runs where the "
+                    f"model second-guesses itself on `wc -l` / `head` / "
+                    f"`grep` inspection commands, or re-issues the same "
+                    f"discovery call to 'confirm' the same fact. Not a "
+                    f"correctness bug — just wasted turn budget. If you "
+                    f"see this often, consider a smaller / faster model "
+                    f"or bumping `MAX_ITERATIONS` for the affected agent."
+                )
             # (k) PN20 iter 11 (2026-09-04): wpscan JSON output empty
             # despite wpscan being called. Likely target-connection
             # failure or wpscan aborted pre-write.

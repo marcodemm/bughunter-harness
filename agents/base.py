@@ -443,6 +443,11 @@ class BaseAgent:
         # Each entry: {"sig": "<tool_name>::<json args truncated>", "timeout": bool}.
         _tool_call_ring: list[dict] = []
         _loop_warned_once = False
+        # Fix A iter 17 (2026-09-05): benign-loop path — same command
+        # ≥4 times in a row regardless of exit code. Different flag so
+        # a benign-loop warning doesn't gate the timeout-loop path (and
+        # vice versa).
+        _benign_loop_warned_once = False
 
         while self.turns < max_iterations_run:
             self.turns += 1
@@ -568,9 +573,9 @@ class BaseAgent:
                                 or "shell_timeout_sec" in red.lower())
                 _tool_call_ring.append({"sig": _loop_sig,
                                          "timeout": _timeout_hit})
-                # Keep ring short
-                if len(_tool_call_ring) > 5:
-                    _tool_call_ring[:] = _tool_call_ring[-5:]
+                # Keep ring short — must hold ≥4 for the benign-loop path
+                if len(_tool_call_ring) > 6:
+                    _tool_call_ring[:] = _tool_call_ring[-6:]
                 # Warn at 2 identical timeouts
                 if (len(_tool_call_ring) >= 2
                         and _tool_call_ring[-1]["sig"] == _tool_call_ring[-2]["sig"]
@@ -621,6 +626,45 @@ class BaseAgent:
                         self.turns, self.tool_calls,
                         reason="loop-detection: 3× same timeout, forced finish")
                     return "done"
+
+                # Fix A iter 17 (2026-09-05): benign-loop path.
+                # ≥4 IDENTICAL tool calls in a row, regardless of exit
+                # code (typically all succeed exit=0 in ~0-1s each, so
+                # the timeout-loop path does NOT catch this). Real-run
+                # trigger: an LLM stuck on `wc -l <file>` 6 times in a
+                # row, deliberating without picking a next action, or
+                # re-issuing the same `grep` in successive turns to
+                # "confirm" the same fact.
+                #
+                # Warn only (no force-finish) — benign loops often
+                # self-correct on the next turn once the LLM sees the
+                # nudge. Force-finish is reserved for the hard case
+                # (3 consecutive shell timeouts) where continuing burns
+                # 15+ minutes per retry.
+                if (len(_tool_call_ring) >= 4
+                        and _tool_call_ring[-1]["sig"] == _tool_call_ring[-2]["sig"] == _tool_call_ring[-3]["sig"] == _tool_call_ring[-4]["sig"]
+                        and not _benign_loop_warned_once):
+                    _benign_loop_warned_once = True
+                    _benign_warn = (
+                        "⚠️ REPEAT-CALL DETECTED: you've just called "
+                        f"`{name}` with IDENTICAL arguments 4 times in a "
+                        "row. The command may succeed each time, but the "
+                        "pipeline isn't advancing — you're re-checking "
+                        "the same fact without acting on it. Take a "
+                        "DIFFERENT action: (a) use the result you already "
+                        "have and move to the next logical step "
+                        "(fingerprint / httpx / finish()), (b) if the "
+                        "output was wrong or empty, try a different "
+                        "command entirely, or (c) call finish() with what "
+                        "you have. Do NOT emit the same call a 5th time.")
+                    messages.append({"role": "system",
+                                      "content": _benign_warn})
+                    state.log(self.NAME, "warn",
+                               f"benign-loop-detected: same {name} call "
+                               f"4× in a row (no timeout, just no "
+                               f"progress) — injected nudge to LLM.")
+                    state.set("benign_loop_detected_count",
+                               (state.get("benign_loop_detected_count") or 0) + 1)
 
         # loop exit without finish() → treat as done anyway
         elapsed = time.time() - started
