@@ -1,0 +1,453 @@
+# ─────────── LLM backend ──────────────────────────────────────────
+# 7 OpenAI-compatible backends supported:
+#   LOCAL (auto-probed, no API key):
+#     lmstudio   http://127.0.0.1:1234/v1
+#     ollama     http://127.0.0.1:11434/v1
+#     llamacpp   http://127.0.0.1:8080/v1
+#   CLOUD (require API key + $$$; never auto-selected):
+#     openai     https://api.openai.com/v1                             OPENAI_API_KEY
+#     anthropic  https://api.anthropic.com/v1                          ANTHROPIC_API_KEY
+#     nvidia     https://integrate.api.nvidia.com/v1                   NVIDIA_API_KEY
+#     gemini     https://generativelanguage.googleapis.com/v1beta/openai  GEMINI_API_KEY
+# CLI/REPL flags override this section: --servertype, --model, --base-url.
+#
+# Cloud API key sourcing (highest wins):
+#   1. llm.api_key                     (direct value in this file)
+#   2. env var named by llm.api_key_env
+#   3. backend default env var (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
+# Missing key on a cloud servertype = harness aborts with a clear error.
+llm:
+  servertype: "auto"              # auto | lmstudio | ollama | llamacpp |
+                                  # openai | anthropic | nvidia | gemini
+  base_url: ""                    # empty → use the servertype default
+  # API key for cloud backends (leave empty for local):
+  api_key: ""                     # paste key here (less secure)
+  api_key_env: ""                 # env var name (backend default if empty)
+  model: ""                       # empty → auto-detect
+                                  # (anthropic REQUIRES an explicit model)
+
+# Legacy fields (backwards compat with pre-multi-backend versions).
+# If llm.* above is filled, those win. Left here so old configs still work.
+base_url: "http://127.0.0.1:1234/v1"
+api_key: "placeholder"
+model: ""                         # empty = auto-detect
+
+# Sampling
+temperature: 0.3
+max_response_tokens: 2048
+
+# Tool call mode
+#   auto     → model decides when to call tools (STABLE — default)
+#   required → LM Studio enforces strict PEG grammar for tool_calls; some
+#              fine-tuned models (Qwen MoE bughunter etc.) violate it and
+#              crash LM Studio with "peg-native format" errors. The harness
+#              will auto-fallback to "auto" on failure, but "auto" from the
+#              start is more reliable.
+tool_choice: "auto"
+
+# Kill switches (defense in depth)
+max_iterations: 40           # max LLM turns per session
+max_wall_time_sec: 1800      # 30 minutes
+
+# Rate limit — enforced at the tool layer for EVERY http_get/http_post/run_shell.
+# Model cannot bypass. Use 1.0 (1 req/s) as baseline; raise only for lab targets.
+min_request_interval_sec: 1.0
+
+# Per-tool timeouts (seconds). Raise if nuclei/nmap with many templates keeps
+# hitting the timeout; lower if you want the agent to try faster fallbacks.
+shell_timeout_sec: 300     # bash commands (nuclei, nmap, ffuf, ...) — 5 min
+http_timeout_sec: 30       # single http_get / http_post — 30 s
+
+# Wipe /tmp/harness-*, /tmp/gau_*, /tmp/nuclei_* … after report or on exit.
+# Only touches patterns our agents write; leaves unrelated tempfiles alone.
+cleanup_tempfiles: true
+
+# Notifications gate. When true (default), email + Telegram only send when
+# the run produced at least one finding of medium/high/critical severity.
+# Set to false to always notify (useful for debugging the pipeline).
+notify_only_if_findings: true
+
+# ─────────── Quick mode (fast triage + escalate prompt) ────────────
+# When enabled (DEFAULT), the pipeline runs a REDUCED first pass:
+#   - SKIPS: login_probe, wordpress, api_fuzzer, auth
+#   - SKIPS: adversarial review post-report
+#   - RUNS with halved MAX_ITERATIONS: fingerprint, content_discovery, web_vuln
+#     (with a system-prompt reminder telling them to skip ffuf/sqlmap/dalfox/
+#     nikto-full and prefer nuclei -tags cve,exposures -severity high,critical)
+# Duration: ~8-15 min single-host, ~15-25 min multi-host top-1.
+#
+# When the quick pass finishes, the orchestrator evaluates escalate criteria.
+# If any fires (and --no-escalate not set), it prompts Y/N (or auto-escalates
+# if --auto-escalate). If escalate = YES, the skipped agents run now on the
+# same state — no wasted work.
+#
+# CLI overrides:
+#   --complete       force full pipeline for this run (skip quick entirely)
+#   --quick          force quick even if disabled in config
+#   --auto-escalate  no prompt, escalate on criteria fire
+#   --no-escalate    never escalate; leave "Escalate suggested" in REPORT.md
+quick_mode:
+  enabled: true                # DEFAULT — fast triage first
+  auto_escalate: true          # DEFAULT — escala sin preguntar cuando criteria
+                               # dispara. Set false to require Y/N prompt (with
+                               # 30s timeout) — better for supervised runs.
+                               # CLI --no-escalate blocks escalate no matter
+                               # what; CLI --auto-escalate forces true for the
+                               # run.
+  escalate_min_severity: "high" # trigger escalate if any finding >= this sev
+  escalate_min_host_score: 40  # trigger escalate if a prioritized sub has
+                               # score >= this (~HIGH tier)
+  escalate_on_takeover: true   # takeover finding always escalates
+  escalate_on_auth_protected_juicy: true
+  escalate_prompt_timeout_sec: 30  # (only used when auto_escalate=false)
+                                    # no answer → declined
+  # Techs that trigger escalate on their own (heavy CVE history, worth
+  # a full pass with sqlmap/dalfox/wpscan/etc.).
+  high_value_techs:
+    - jenkins
+    - gitlab
+    - grafana
+    - kibana
+    - portainer
+    - dokploy
+    - coolify
+    - adminer
+    - phpmyadmin
+    - webmin
+    - phpldapadmin
+    - vault
+    - keycloak
+    - elasticsearch
+    - n8n
+    - hasura
+    - superset
+    - guacamole
+    - rundeck
+    - awx
+    - argocd
+    - code-server
+    - jupyterhub
+    - odoo
+    - metabase
+    - redash
+    - switchvox
+    - sangoma
+    - asterisk
+    - freepbx
+    - wordpress
+    - drupal
+    - magento
+    - joomla
+
+# ─────────── Pre-flight reachability check ─────────────────────────
+# Before spawning any agent, the orchestrator sends a single HTTP GET
+# via python-requests to the target (10s timeout). Behavior on failure
+# depends on `strict`:
+#
+#   strict: false (DEFAULT — soft-warn)
+#     A probe fail is a WARN + continue. Agents still run — their
+#     Go-stdlib TLS (nuclei / httpx / subfinder / dnsx) or curl-LibreSSL
+#     often reach targets where python-requests hits JA3/JA4 blocking
+#     or a fussy handshake. REPORT.md gets a ⚠️ Pre-flight warning banner.
+#
+#   strict: true
+#     A probe fail ABORTS the pipeline (previous behavior). Only the
+#     report agent runs; REPORT.md carries a 🚨 TARGET UNREACHABLE
+#     banner. Use when you want to save LLM turns on truly dead hosts.
+#
+# CLI flags override this section:
+#   --strict-preflight   → strict: true for this run
+#   --skip-preflight     → do not probe at all (for VPN/allowlist targets)
+preflight:
+  strict: false                # true = ABORT on probe fail, false = WARN
+  timeout_sec: 10              # HTTP GET timeout for the probe
+
+# ─────────── Adversarial review (post-pipeline gate) ───────────────
+# After the report agent finishes, each finding whose severity is >=
+# min_severity is sent to an LLM for adversarial verification. Findings
+# that come back REJECT are moved out of state.findings into
+# state.rejected_findings (still visible in REPORT.md but suppressed from
+# email/Telegram notifications).
+#
+# Applies a strict 7-question gate by default (specific endpoint? concrete
+# impact? severity matches evidence? triager-reproducible? in-scope? would
+# the program pay? not a known-duplicate class?). Only findings that pass
+# ALL 7 survive.
+#
+# Cost: ONE LLM call per eligible finding, max_tokens=200, temperature=0.1.
+# With the default min_severity=medium a typical run adds seconds, not
+# minutes. Disable with `enabled: false` OR CLI --no-adversarial for the
+# fastest possible runs (e.g. quick recon-only against many targets).
+#
+# By default reuses the SAME model/backend as llm.* — works fine on a
+# single-slot LM Studio. Override servertype/base_url/api_key/model here
+# if you want a different reviewer (e.g. local Qwen for agents, cloud
+# Sonnet for review).
+adversarial_review:
+  enabled: true                # true | false — hard toggle
+  min_severity: "medium"       # info | low | medium | high | critical
+  max_findings: 20             # cap so a 200-finding run doesn't cost 200 calls
+  reject_action: "hide"        # "hide" → move to rejected_findings
+                               # "flag" → keep in findings, mark with verdict
+  # Reviewer LLM overrides — leave EMPTY to reuse the main llm.* backend.
+  servertype: ""               # "" | lmstudio | ollama | ... | anthropic | ...
+  base_url: ""
+  api_key: ""
+  api_key_env: ""
+  model: ""                    # "" = same model as llm.model (Bughunter v8 default)
+  # Prompt template: "default" applies the built-in 7-question gate,
+  # or set to the path of your own .md file with a custom rubric.
+  prompt_template: "default"
+
+# ─────────── WPScan API token (WordPress Vulnerability DB) ──────────
+# Optional. Enables CVE lookup against the WPScan Vulnerability
+# Database when the wordpress agent runs wpscan. Without a token,
+# wpscan still enumerates plugins/versions but WON'T cross-match
+# against known CVEs → 0 CVE match even when a plugin is outdated
+# (useful info but incomplete).
+#
+# Free tier: 25 requests/day. Register: https://wpscan.com/register
+# Sourcing (highest wins):
+#   1. wpscan.api_token       (direct value in this file)
+#   2. env var wpscan.api_token_env (if api_token empty)
+# The wordpress agent injects the token as env WPSCAN_API_TOKEN before
+# every subprocess → its system prompt tells the LLM to add
+# `--api-token "$WPSCAN_API_TOKEN"` to wpscan commands when set.
+wpscan:
+  api_token: ""                        # paste your token here (25/day free tier)
+  api_token_env: "WPSCAN_API_TOKEN"    # env var used if api_token is empty
+
+# ─────────── Shodan (free InternetDB + optional Pro w/ throttle) ─────
+# Two tiers:
+#   1) InternetDB (https://internetdb.shodan.io/<ip>) — FREE, no API
+#      key, no rate limit. The recon agent enriches every live_host
+#      with passive intel (open ports, known CVE ids, tags, vulns)
+#      automatically; sub_prioritizer picks these up as a new signal
+#      that bumps scores of hosts Shodan has already indexed as
+#      interesting. Zero cost, never disabled unless internetdb_enabled=false.
+#   2) Pro (https://api.shodan.io/shodan/host/search) — PAID. Only
+#      activated if api_key is set. The tool `shodan_search` becomes
+#      available to the LLM (favicon_hash pivots, org: filters, JARM,
+#      cert SAN, …) but with a hard throttle: max_pro_calls_per_run
+#      calls MAX per run. Protects the operator's quota — the LLM
+#      cannot burn it accidentally.
+#
+# Sourcing (highest wins):
+#   1. shodan.api_key       (direct value in this file)
+#   2. env var shodan.api_key_env (if api_key empty)
+# Register Pro key at https://account.shodan.io (paid).
+shodan:
+  api_key: ""                          # paste your Pro key here (optional)
+  api_key_env: "SHODAN_API_KEY"        # env var used if api_key is empty
+  max_pro_calls_per_run: 2             # Pro throttle (0 = disable Pro entirely)
+  internetdb_enabled: true             # set false to disable InternetDB too
+
+# ─────────── Multi-host mode (loop scan over ranked subs) ─────────
+# When enabled: after recon + sub_prioritizer rank state.live_hosts by
+# attack-surface priority (name / status / tech / title / port heuristic),
+# the pipeline runs fingerprint → content_discovery → login_probe →
+# web_vuln → wordpress → api_fuzzer → auth ONCE PER TOP-N SUB instead of
+# once against the primary target only.
+#
+# This is the difference between "scans www.target and misses admin.target
+# where the WP-admin actually lives" and "hits admin.target, dev.target,
+# api.target with full agent power".
+#
+# Findings from each per-sub pass are tagged with `sub_scanned` so the
+# REPORT.md can group them per host.
+#
+# Selection: top_n hosts by score. Optional min_score raises the bar (a
+# host below min_score is only scanned if fewer than top_n hosts meet it).
+#
+# Cost: LINEAR in top_n. Each per-sub pass is a full pipeline stage set.
+# Rule of thumb with LM Studio + Qwen v8: ~25-40 min for top_n=1 →
+# ~1h20m for top_n=3. Use --no-adversarial and --skip-preflight for speed.
+#
+# Override per-run with CLI/REPL flags:
+#   --multi-host          → force enabled=true for this run
+#   --single-host         → force enabled=false for this run
+#   --top-hosts N         → override top_n
+#
+# AUTO-ENABLE rule: if ANY --scope pattern starts with '*.' (a wildcard,
+# e.g. --scope '*.example.com'), multi-host is AUTO-ENABLED for that
+# run regardless of the `enabled` value below — you almost always want
+# it in that case. Pass --single-host to override the auto-enable.
+multi_host:
+  enabled: false               # default off (single-host = fastest single-run)
+                               # — auto-flipped to ON if scope has *.<domain>
+  top_n: 1                     # scan top-1 prioritized sub only
+                               # — raise to 3-5 for wider coverage at 3-5× the wall-clock;
+                               # CLI --top-hosts N overrides per run.
+  min_score: 30                # only include subs with score >= 30
+                               # (falls back to top_n if nothing meets it)
+  # Agents that run ONCE PER SUB in the loop. `recon` and `sub_prioritizer`
+  # always run once (pre-loop). `report` always runs once (post-loop).
+  agents_to_repeat:
+    - fingerprint
+    - content_discovery
+    - login_probe
+    - web_vuln
+    - wordpress
+    - api_fuzzer
+    - auth
+
+# ─────────── Extension framework (drop-in add-ons) ─────────────────
+# The harness auto-discovers plugins under extensions/ at startup:
+#   extensions/agents/*.py       → BaseAgent subclasses inserted into the
+#                                   pipeline (position controlled by each
+#                                   agent's ENTRY_AFTER class attribute)
+#   extensions/tools/*.yaml      → binaries added to the shell allowlist,
+#                                   with prompt_hint injected into agents'
+#                                   system prompts so the model knows to use them
+#   extensions/techniques/*.md   → knowledge base with YAML frontmatter,
+#                                   loaded into an agent's prompt when the
+#                                   target context matches the technique's
+#                                   `applies_when` rules
+#
+# See EXTENDING.md for the full guide + minimal examples of each type.
+# Extensions are pure additions: they never modify core behavior; a
+# malformed extension is logged and skipped, never crashes the pipeline.
+extensions:
+  enabled: true                # false → skip extension discovery entirely
+  # Optional: additional lookup directories (comma-separated, absolute or
+  # relative to the harness root). Extensions in the built-in `extensions/`
+  # directory are ALWAYS loaded when enabled=true.
+  extra_dirs: []               # e.g. ["/opt/shared-extensions", "~/my-plugins"]
+
+# Custom HTTP headers auto-injected on every http_get / http_post request.
+# The model is also told to add these via -H "..." on curl/nuclei/ffuf/httpx/
+# katana shell commands. Useful for researcher-attribution so the target's
+# security team can identify traffic as authorized research.
+# Overridable per-session in the REPL:  --header "Name: value"  (repeatable)
+#
+# Two ways to configure:
+#   (a) No headers — leave as empty dict:
+#         custom_headers: {}
+#   (b) One or more headers (block-style, recommended for readability):
+#         custom_headers:
+#           X-HackerOne-Researcher: yourhandle
+#           X-Bugcrowd-Researcher:  yourhandle
+#           X-Bug-Bounty:           research
+#
+# Default: no custom headers.
+custom_headers: {}
+
+# B4 fix (2026-09-08) — researcher's OWN infrastructure allowlist.
+# Hostnames / globs in this list are FILTERED OUT of the ranked hosts
+# list BEFORE scoring, so they never appear in the report table and are
+# skipped by every subsequent agent (nuclei / wpscan / content_discovery
+# / …). Use this to keep your OOB catcher, callback domain, lab boxes,
+# and Burp Collaborator subdomains out of accidental scans.
+#
+# Why it matters (2026-09-08 write-verb incident, real audit): the
+# harness ranked the researcher's own OOB catcher subdomain MEDIUM
+# alongside real target subs and would happily have run nuclei against
+# it — that both poisons the catcher's logs with the harness's own
+# hits AND could cause payloads to fire against the researcher's infra
+# when a callback base URL happens to equal that same subdomain.
+#
+# Glob syntax:
+#   - `oob.example.net`     exact hostname match
+#   - `*.example.net`       any hostname ending in `.example.net`
+#   - `example.net`         apex + implicit *.example.net
+#
+# The list below covers common OOB / Collaborator patterns. Add your
+# own subs (your `oob.<yourdomain>`, your Collaborator subdomain, any
+# staging box you use as a callback target). Leave empty `[]` to
+# disable the filter entirely (not recommended if you use OOB tooling).
+researcher_infra_allowlist:
+  # Public OAST services (nuclei / Burp interactsh)
+  - "*.oast.me"
+  - "*.oast.pro"
+  - "*.oast.site"
+  - "*.oast.online"
+  - "*.oast.fun"
+  - "*.oast.live"
+  - "*.interact.sh"
+  # Burp Collaborator
+  - "*.oastify.com"
+  - "*.burpcollaborator.net"
+  # Your own OOB catcher — REPLACE with your domain(s), do NOT
+  # ship the example one to a target scan. Kept as a template
+  # entry; delete or replace before use on any real engagement.
+  # - "oob.example.com"
+
+# In-scope allowlist file (one host/wildcard/CIDR per line)
+scope_file: "scope.txt"
+
+# Scope enforcement mode
+#   strict  → reject requests outside scope.txt (SAFE — default)
+#   warn    → allow but log a warning on every off-scope request
+#   off     → do not validate scope (FREE — only for authorized exploration)
+# Warning: warn/off disable the last line of defence. Use only for engagements
+# without a scope list, or when the operator supervises manually.
+scope_enforcement: "strict"
+
+# OOB catcher — used by tool oob_generate_token
+# Set to your self-hosted domain; NEVER third-party services.
+# Leave empty to disable the tool.
+oob_host: ""                 # e.g. "oob.example.com"
+oob_token_prefix: "harness"  # tokens will be <prefix>-<vector>-<label>
+
+# Telegram notification at end of pipeline (sends executive summary +
+# REPORT.md file). Setup:
+#   1. Talk to @BotFather in Telegram → /newbot → save the bot token
+#   2. Start a chat with your bot (send it /start or any message)
+#   3. curl https://api.telegram.org/bot<TOKEN>/getUpdates
+#      → find "chat":{"id":<CHAT_ID>,...}
+#   4. Export the token as an env var, never store it in this YAML:
+#        export TELEGRAM_BOT_TOKEN='123456:ABC-DEF...'
+#   5. Put the chat_id here (or export $TELEGRAM_CHAT_ID as fallback)
+#
+# Override chat_id per session via CLI/REPL:  --telegram <CHAT_ID>
+telegram:
+  enabled: false
+  # Two ways to provide the bot token — direct value wins:
+  bot_token: ""                          # paste token here (less secure)
+  bot_token_env: "TELEGRAM_BOT_TOKEN"    # OR set this env var (recommended)
+  chat_id: ""                            # numeric or -100... for groups
+  chat_id_env: "TELEGRAM_CHAT_ID"        # fallback env var
+  send_summary_text: true                # executive summary as text message
+  send_report_file: true                 # REPORT.md as document attachment
+
+# SMTP config for --email flag (end-of-session report).
+#
+# Two modes, auto-selected:
+#   AUTH mode : host AND username both set   → uses password from env var
+#   LOCAL mode: host or username empty       → connects to 127.0.0.1:25 (or
+#                                              host:port if partially set),
+#                                              NO auth, NO TLS. Requires a
+#                                              local MTA listening.
+#
+# AUTH example (Gmail — password_env = SMTP_PASSWORD, App Password required):
+#   export SMTP_PASSWORD='xxxx xxxx xxxx xxxx'
+#   smtp:
+#     host: "smtp.gmail.com"
+#     port: 587
+#     from: "you@example.com"
+#     username: "you@example.com"
+#     password_env: "SMTP_PASSWORD"
+#     use_ssl: false
+#
+# LOCAL example (Mailpit dev inbox on macOS: `brew install mailpit && mailpit`):
+#   smtp:
+#     host: "127.0.0.1"
+#     port: 1025
+#     from: "harness@localhost"
+#     username: ""             # empty → local mode
+#
+# Leave the whole `smtp:` block out (or fields empty) for local-mode default
+# at 127.0.0.1:25.
+smtp:
+  host: ""                   # empty → local relay at 127.0.0.1
+  port: 25
+  from: ""                   # empty → auto: harness@<hostname>
+  username: ""               # empty → no auth (local mode)
+  # Two ways to provide the SMTP password — direct value wins:
+  password: ""               # paste password here (less secure)
+  password_env: "SMTP_PASSWORD"  # OR set this env var (recommended)
+  use_ssl: false             # false=STARTTLS(587) · true=SSL direct(465)
+  # Default recipient. If set, email auto-sends at end of pipeline WITHOUT
+  # needing --email on the CLI. Overridable with --email <addr>. Leave
+  # empty to require the flag explicitly.
+  default_to: ""             # e.g. "me@example.com"

@@ -1,0 +1,36 @@
+# Example extension tool — subjack subdomain takeover scanner.
+#
+# Drop this file (renamed) in extensions/tools/ to add a binary to the
+# run_shell allowlist and give the agents a prompt hint on how to use it.
+# If the binary is not installed the agent using it will simply see a
+# "command not found" from run_shell and can gracefully fall back.
+
+binary: subjack
+
+# One-line install hint — surfaced in EXTENDING.md and error messages.
+install_hint: "go install github.com/haccer/subjack@latest"
+
+# Optional: if true, the extension framework refuses to enable this tool
+# when the binary is missing from PATH — cleaner than a runtime error but
+# means the operator must install it before use. Default: false (permissive).
+require_installed: false
+
+# Prompt hint injected into agents' system prompts so the model knows
+# WHEN and HOW to invoke this binary via run_shell.
+prompt_hint: |
+  For subdomain takeover verification (after recon populates state.subdomains):
+    subjack -w subs.txt -t 20 -timeout 30 -ssl -v \
+      -c $(go env GOPATH)/src/github.com/haccer/subjack/fingerprints.json
+  Output lines are of the form:
+    [Vulnerable] example.foo.com -> unclaimed.s3.amazonaws.com
+  Treat each "[Vulnerable]" line as a CRITICAL finding.
+
+# Optional: hint the harness's after_run parser about the output format.
+# Both output_parser and finding_template are advisory — you still write
+# custom parsing in your agent's after_run() for anything non-trivial.
+output_parser: 'regex:\[Vulnerable\]\s+(?P<sub>\S+)\s+->\s+(?P<target>\S+)'
+
+finding_template:
+  severity: critical
+  title: "Subdomain takeover: {sub} → {target}"
+  recommendation: "Remove the dangling CNAME OR reclaim the third-party resource."
