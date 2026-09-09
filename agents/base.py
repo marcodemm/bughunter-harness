@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,64 @@ def _now_iso() -> str:
 
 
 MAX_NO_TOOL_RETRIES = 3
+
+# Fix A (2026-09-09 iter 19) — similarity-based benign-loop detector.
+# Previous exact-match version (`sig_a == sig_b`) FAILED to catch the
+# Chainlink run 20260909T082702Z where the LLM alternated `gau, cat, gau,
+# cat, ...` for 2 hours: exact-match never saw 4 identical consecutive
+# calls because the pattern was ABAB (only 2 of each in a row), and when
+# the LLM approached the threshold it changed ONE char (`| head -30`,
+# `--o`, another flag) as "trying different approach" → new signature →
+# counter reset.
+# The fix: use SequenceMatcher ratio to detect near-duplicates + count
+# per-signature-cluster (not per exact-signature).
+BENIGN_LOOP_SIMILARITY_THRESHOLD = 0.85     # ratio ≥ 0.85 = "same intent"
+BENIGN_LOOP_MIN_CLUSTER_SIZE = 4            # ≥4 near-dupes in ring → nudge
+
+
+def _benign_loop_cluster_size(ring: list[dict]) -> int:
+    """Fix A (2026-09-09 iter 19): count how many entries in the last 6
+    calls are near-duplicates (SequenceMatcher ratio ≥ 0.85) of the most
+    recent call. Handles ABAB alternation + micro-variations that the old
+    exact-match detector missed.
+
+    Returns the size of the largest near-dupe cluster including the last
+    call. Caller compares against BENIGN_LOOP_MIN_CLUSTER_SIZE (4)."""
+    if len(ring) < BENIGN_LOOP_MIN_CLUSTER_SIZE:
+        return 0
+    last_sig = ring[-1]["sig"]
+    cluster = 1
+    for entry in ring[:-1]:
+        if _sigs_similar(last_sig, entry["sig"]):
+            cluster += 1
+    return cluster
+
+
+def _sigs_similar(sig_a: str, sig_b: str,
+                  threshold: float = BENIGN_LOOP_SIMILARITY_THRESHOLD
+                  ) -> bool:
+    """Fix A (2026-09-09 iter 19): SequenceMatcher.ratio() ≥ threshold.
+
+    Fast rejection ONLY for obviously-different tool names (different
+    tool = different intent). Length ratio fast-reject REMOVED after
+    unit test v1 showed it wrongly rejected `cat file` vs `cat file |
+    head -30` (length ratio 0.59 < 0.85) which IS the Chainlink bug
+    pattern we want to catch. Falls back to full SequenceMatcher on
+    all same-tool comparisons.
+
+    Performance: SequenceMatcher is O(n·m) but signatures are capped
+    at 400 chars ([:400] in _loop_sig). Worst case ~160k operations
+    per compare × ring size 6 = 960k ops per tool_call ≈ <10 ms. Fine."""
+    if not sig_a or not sig_b:
+        return False
+    if sig_a == sig_b:
+        return True
+    # Fast reject: different tool name (before the `::` separator)
+    a_head = sig_a.split("::", 1)[0]
+    b_head = sig_b.split("::", 1)[0]
+    if a_head != b_head:
+        return False
+    return SequenceMatcher(None, sig_a, sig_b).ratio() >= threshold
 
 
 def _extract_embedded_findings(summary: str) -> list[str]:
@@ -684,28 +743,40 @@ class BaseAgent:
                 # nudge. Force-finish is reserved for the hard case
                 # (3 consecutive shell timeouts) where continuing burns
                 # 15+ minutes per retry.
-                if (len(_tool_call_ring) >= 4
-                        and _tool_call_ring[-1]["sig"] == _tool_call_ring[-2]["sig"] == _tool_call_ring[-3]["sig"] == _tool_call_ring[-4]["sig"]
+                # Fix A (2026-09-09 iter 19) — similarity-based cluster
+                # detection. See _benign_loop_cluster_size() docstring for
+                # the Chainlink 20260909T082702Z root cause: exact-match
+                # missed ABAB alternation + micro-variations, LLM stayed
+                # in improductive loop 2 hours without trigger.
+                _cluster_size = _benign_loop_cluster_size(_tool_call_ring)
+                if (_cluster_size >= BENIGN_LOOP_MIN_CLUSTER_SIZE
                         and not _benign_loop_warned_once):
                     _benign_loop_warned_once = True
                     _benign_warn = (
-                        "⚠️ REPEAT-CALL DETECTED: you've just called "
-                        f"`{name}` with IDENTICAL arguments 4 times in a "
-                        "row. The command may succeed each time, but the "
-                        "pipeline isn't advancing — you're re-checking "
-                        "the same fact without acting on it. Take a "
-                        "DIFFERENT action: (a) use the result you already "
-                        "have and move to the next logical step "
-                        "(fingerprint / httpx / finish()), (b) if the "
-                        "output was wrong or empty, try a different "
-                        "command entirely, or (c) call finish() with what "
-                        "you have. Do NOT emit the same call a 5th time.")
+                        "⚠️ REPEAT-CALL DETECTED: you've called "
+                        f"`{name}` with SIMILAR arguments "
+                        f"{_cluster_size} times in the last 6 turns "
+                        "(alternation + micro-variations count as "
+                        "similar). The commands may each succeed, but "
+                        "the pipeline isn't advancing — you're "
+                        "re-checking the same fact without acting on "
+                        "it. Take a DIFFERENT action: (a) use the "
+                        "result you already have and move to the next "
+                        "logical step (fingerprint / httpx / finish()), "
+                        "(b) if the output was wrong or empty, try a "
+                        "COMPLETELY different command (different tool, "
+                        "different target, different approach — NOT "
+                        "just a flag tweak), or (c) call finish() with "
+                        "what you have. Do NOT emit another similar "
+                        "call.")
                     messages.append({"role": "system",
                                       "content": _benign_warn})
                     state.log(self.NAME, "warn",
-                               f"benign-loop-detected: same {name} call "
-                               f"4× in a row (no timeout, just no "
-                               f"progress) — injected nudge to LLM.")
+                               f"benign-loop-detected: {name} called "
+                               f"with SIMILAR args {_cluster_size}× "
+                               f"in last 6 turns (similarity threshold "
+                               f"{BENIGN_LOOP_SIMILARITY_THRESHOLD}) — "
+                               f"injected nudge to LLM.")
                     state.set("benign_loop_detected_count",
                                (state.get("benign_loop_detected_count") or 0) + 1)
 

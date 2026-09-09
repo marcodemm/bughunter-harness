@@ -346,6 +346,31 @@ SHELL SYNTAX — CRITICAL (repeated denylist violations kill turn budget):
                       f"webhook.site) inside the target's path — LLM "
                       f"cargocult from XSS payload wordlists it saw during "
                       f"training, not real crawl-derived URLs")
+
+        # Fix C (2026-09-09 iter 19) — hard cap on harvest set size to
+        # prevent memory bloat + downstream HEAD-probe explosion on
+        # targets with massive Wayback footprint (Chainlink case: after
+        # the 4 MB tmp-file cap + off-domain / malformed / C3 filters,
+        # still ~1000-5000 in-scope URLs remained → Fix B caps the
+        # HEAD-probe but this cap keeps `found` bounded for future
+        # in-memory processing too). Default 5000, configurable.
+        MAX_HARVEST_URLS = int(
+            self.cfg.get("content_discovery_max_harvest_urls", 5000))
+        if len(found) > MAX_HARVEST_URLS:
+            _pre_trim = len(found)
+            # Deterministic sample: keep the first N by sort order so
+            # runs on the same target harvest the same subset (audit
+            # reproducibility)
+            found = set(sorted(found)[:MAX_HARVEST_URLS])
+            state.log(self.NAME, "warn",
+                      f"C-cap filter: harvest yielded {_pre_trim} "
+                      f"in-scope URLs, trimmed to {MAX_HARVEST_URLS} "
+                      f"(sorted deterministic first-N; config "
+                      f"`content_discovery_max_harvest_urls`). "
+                      f"Increase cap only if you're audit-focused; "
+                      f"defaults are tuned for targets with heavy "
+                      f"Wayback footprint (Chainlink-class) where "
+                      f"probing 5000+ URLs at 0.5 req/s takes 40+ min.")
         # PN10 fix (2026-09-04): HEAD-probe every candidate before
         # promoting to endpoints_found. `.well-known/*` are RFC 8615
         # canonical paths content_discovery probes on every target;
@@ -355,8 +380,20 @@ SHELL SYNTAX — CRITICAL (repeated denylist violations kill turn budget):
         #   endpoints_found          → status 2xx/3xx (real)
         #   endpoints_probed_negative → status 4xx/5xx/000 (attempted)
         # Report renders them in two separate sections.
+        #
+        # Fix B (2026-09-09 iter 19) — hard cap + periodic log to avoid
+        # silent blocking when gau/wayback returns thousands of URLs
+        # (Chainlink `faucets.chain.link` run 20260909T082702Z: 3.7 MB
+        # of harvested URLs → HEAD-probe at 0.5 req/s throttle = HOURS
+        # of blocking with no intermediate log). Cap keeps worst-case
+        # runtime at ~MAX_HEAD_PROBE × 0.5s = ~4 min for default 500.
+        MAX_HEAD_PROBE = int(self.cfg.get("content_discovery_max_head_probe",
+                                            500))
+        HEAD_PROBE_LOG_EVERY = int(self.cfg.get(
+            "content_discovery_head_probe_log_every", 50))
         confirmed: list[dict] = []
         negative: list[dict] = []
+        head_probe_capped_at: int | None = None
         if found:
             try:
                 import requests as _rq
@@ -370,7 +407,29 @@ SHELL SYNTAX — CRITICAL (repeated denylist violations kill turn budget):
             _hdrs.setdefault("User-Agent",
                               "Mozilla/5.0 (compatible; bughunter-harness/1)")
             _seen_5xx: set[str] = set()
-            for u in sorted(found):
+            _sorted_found = sorted(found)
+            _total_to_probe = min(len(_sorted_found), MAX_HEAD_PROBE)
+            if len(_sorted_found) > MAX_HEAD_PROBE:
+                head_probe_capped_at = MAX_HEAD_PROBE
+                state.log(self.NAME, "warn",
+                          f"HEAD-probe capped: {len(_sorted_found)} URLs "
+                          f"harvested but only probing first "
+                          f"{MAX_HEAD_PROBE} (config "
+                          f"`content_discovery_max_head_probe`). "
+                          f"Skipped {len(_sorted_found) - MAX_HEAD_PROBE} "
+                          f"URLs — probably a target with heavy Wayback "
+                          f"footprint (Chainlink-class). Increase the "
+                          f"cap only if you're audit-focused and can "
+                          f"afford the extra 0.5s×N latency.")
+            for _idx, u in enumerate(_sorted_found[:MAX_HEAD_PROBE]):
+                # Fix B — log every N URLs so operator sees progress
+                # (prev: silent block, appeared as "harness stuck")
+                if _idx > 0 and _idx % HEAD_PROBE_LOG_EVERY == 0:
+                    state.log(self.NAME, "info",
+                              f"HEAD-probe progress: "
+                              f"{_idx}/{_total_to_probe} URLs probed, "
+                              f"{len(confirmed)} confirmed, "
+                              f"{len(negative)} negative so far")
                 # Skip repeated 5xx paths on the same host to avoid MySQL
                 # pool exhaust on unstable WP sites — many VDPs prohibit
                 # anything that could hurt availability, so short-circuit
@@ -411,10 +470,14 @@ SHELL SYNTAX — CRITICAL (repeated denylist violations kill turn budget):
             state.extend("endpoints_found", confirmed)
         if negative:
             state.extend("endpoints_probed_negative", negative)
+            _cap_note = ""
+            if head_probe_capped_at is not None:
+                _cap_note = (f" — capped at {head_probe_capped_at} "
+                             f"(see WARN above for skipped count)")
             state.log(self.NAME, "info",
                        f"HEAD-probe filter: {len(confirmed)} endpoint(s) "
                        f"confirmed status 2xx/3xx, {len(negative)} probed "
-                       f"negative (4xx/5xx/000) — see REPORT sections")
+                       f"negative (4xx/5xx/000){_cap_note} — see REPORT sections")
         # PN22a iter 14 (2026-09-05): if the harvest and filter ended
         # with 0 confirmed endpoints, emit an explicit line so the
         # operator (and the report) don't have to infer it from the
