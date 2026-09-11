@@ -159,8 +159,18 @@ quick_mode:
 #   --strict-preflight   → strict: true for this run
 #   --skip-preflight     → do not probe at all (for VPN/allowlist targets)
 preflight:
-  strict: false                # true = ABORT on probe fail, false = WARN
+  strict: false                # true = ABORT on probe fail, false = WARN + continue
   timeout_sec: 10              # HTTP GET timeout for the probe
+# NOTE: even with `strict: false`, the pipeline ABORTS anyway when the
+# probe fails with a marker that no agent can recover from:
+#   invalid input : InvalidURL, No host supplied, MissingSchema,
+#                   InvalidSchema, empty target
+#   network dead  : NXDOMAIN, Name or service not known, getaddrinfo failed,
+#                   Temporary failure in name resolution, Connection refused,
+#                   No route to host, Network is unreachable
+# ConnectTimeout is intentionally NOT fatal — a WAF that drops the python-
+# requests probe may still accept curl-impersonate / katana with a browser
+# fingerprint. Set `strict: true` here to abort on ConnectTimeout too.
 
 # ─────────── Adversarial review (post-pipeline gate) ───────────────
 # After the report agent finishes, each finding whose severity is >=

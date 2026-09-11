@@ -385,6 +385,50 @@ Config in [`config.example.yaml → quick_mode:`](config.example.yaml).
 
 ---
 
+## Pre-flight target reachability
+
+Before the agent pipeline starts, `orchestrator.py` runs one HTTP probe against the target (`requests.get`, 10 s timeout, all HTTP status codes count as ALIVE, TLS errors count as ALIVE too because the server clearly responded on the port). Three modes:
+
+| Mode | How to enable | Behavior |
+|---|---|---|
+| **Skip** | `--skip-preflight` | No probe at all. Use for VPN-only or IP-allowlist targets where the plain probe is guaranteed to fail by design. |
+| **Soft** (default) | `preflight.strict: false` | Probe. If it fails, WARN and continue anyway — agents run with tools that may pass through (e.g. `curl-impersonate`, `katana` with a browser User-Agent) even when a WAF drops the python-requests fingerprint. |
+| **Strict** | `preflight.strict: true` or `--strict-preflight` | Probe. If it fails, ABORT — only the `report` agent runs to document the failure. Use when you want to save LLM turns on truly dead targets. |
+
+### Fatal markers — always abort, overriding soft mode
+
+Soft mode is generous by design, but two families of failures are unrecoverable no matter how many agents you throw at them. When the pre-flight `reason` contains any of these markers, the pipeline aborts as if `strict: true` were set:
+
+- **Invalid input** (typo in the URL, empty host, wrong scheme):
+  `InvalidURL`, `No host supplied`, `MissingSchema`, `InvalidSchema`, `empty target`.
+- **Network dead**:
+  - DNS: `NXDOMAIN`, `Name or service not known`, `nodename nor servname provided`, `getaddrinfo failed`, `Temporary failure in name resolution`.
+  - Transport: `Connection refused`, `No route to host`, `Network is unreachable`, `Network unreachable`.
+
+`ConnectTimeout` is deliberately **not** fatal — a WAF that drops the python-requests handshake can still accept a browser-shaped fingerprint. `ReadTimeout` already counts as ALIVE upstream (the server accepted the connection, it's just slow).
+
+Example abort message:
+
+```
+[+] Pre-flight: UNREACHABLE · connection error to https://bogus.invalid/: ConnectionError: (Caused by NameResolutionError('[Errno 8] nodename nor servname provided, or not known'))
+
+[!] TARGET UNREACHABLE — aborting pipeline (network unreachable (DNS/connect-refused/no-route)).
+    Reason: connection error to https://bogus.invalid/: …
+    Only the report agent will run to document the failure.
+```
+
+### Config snippet
+
+```yaml
+preflight:
+  strict: false          # default — soft with fatal-marker override
+  timeout_sec: 10        # HTTP GET timeout for the probe
+```
+
+For unstable-network hosts (a mobile chroot, a laptop on roaming cellular, a lab with intermittent NAT) set `strict: true` in the local config as a belt — you lose the WAF-friendly fallback but never waste 40 LLM turns on a host that isn't there.
+
+---
+
 ## Adversarial review (post-pipeline finding gate)
 
 After the report agent runs, every finding whose severity is ≥ `min_severity` (default `medium`) is sent to an LLM with a strict **7-question gate**:

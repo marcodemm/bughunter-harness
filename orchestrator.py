@@ -232,9 +232,44 @@ class Orchestrator:
             alive, reason = self._target_reachable(self.target)
             print(f"[+] Pre-flight: {'ALIVE' if alive else 'UNREACHABLE'} · {reason}")
         if not alive:
-            if pf_strict:
-                print(f"\n[!] TARGET UNREACHABLE — aborting pipeline "
-                      f"(preflight.strict / --strict-preflight).")
+            # Two families of unrecoverable failures — abort even without
+            # --strict-preflight, because no agent/tool can ever recover:
+            #   (a) INPUT errors  → syntactically invalid URL / empty host /
+            #                       missing scheme.  Kali-mobile fix, 2026-09-11.
+            #   (b) NETWORK errors → DNS NXDOMAIN, connection refused (port
+            #                       closed), no route / network unreachable.
+            #                       Extension 2026-09-11 (iter B) after Kali
+            #                       report: mobile ran full pipeline against a
+            #                       host with no ping / no route.
+            # ConnectTimeout is INTENTIONALLY excluded — a WAF that drops the
+            # python-requests probe still may accept katana / curl-impersonate
+            # with a browser-shaped fingerprint. Read timeouts already count
+            # as ALIVE upstream in _target_reachable().
+            _fatal_input_markers = (
+                "InvalidURL", "No host supplied", "MissingSchema",
+                "InvalidSchema", "empty target",
+            )
+            _fatal_network_markers = (
+                # DNS resolution (macOS, Linux, Termux, Alpine, BSD variants)
+                "NXDOMAIN", "Name or service not known",
+                "nodename nor servname provided", "getaddrinfo failed",
+                "Temporary failure in name resolution",
+                # Transport
+                "Connection refused",
+                "No route to host", "Network is unreachable",
+                "Network unreachable",
+            )
+            is_fatal_input = any(m in reason for m in _fatal_input_markers)
+            is_fatal_network = any(m in reason for m in _fatal_network_markers)
+            is_fatal = is_fatal_input or is_fatal_network
+            if pf_strict or is_fatal:
+                if is_fatal_input:
+                    why = "invalid target URL"
+                elif is_fatal_network:
+                    why = "network unreachable (DNS/connect-refused/no-route)"
+                else:
+                    why = "preflight.strict / --strict-preflight"
+                print(f"\n[!] TARGET UNREACHABLE — aborting pipeline ({why}).")
                 print(f"    Reason: {reason}")
                 print(f"    Only the report agent will run to document the failure.")
                 self.state.set("target_unreachable", True)
