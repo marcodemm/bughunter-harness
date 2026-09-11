@@ -194,13 +194,25 @@ The REPL accepts a full CLI-style line — paste the same string you'd use with 
 
 > **Note — the `>` prompt is NOT a shell.** Anything you type that isn't a slash command (`/quit`, `/bye`, `/exit`) or a sticky-flag / CLI-style line (`--target …`, `--scope …`, `--header …`, `--top-hosts N`, etc.) is treated as the objective for the next agent pipeline. The orchestrator boots the 10-agent pipeline against the target parsed out of your input, and the individual agents' LLMs decide the tool calls from there (constrained by the security gates).
 >
-> **Example — ask the agent in natural language:**
+> **Examples — ask the agent in natural language:**
 >
 > ```
 > > run wpscan against https://example.com with --enumerate vp -t 5 --disable-tls-checks --request-timeout 20 --connect-timeout 10 and report the plugins found
 > ```
 >
-> The REPL guard validates the line as a ≥4-word natural-language objective, resolves scope (from sticky `--scope` or auto-inferred from the target) and starts the pipeline. The `wordpress` agent (step 7) is where wpscan actually runs — its LLM sees your objective in `build_objective()` and decides the exact wpscan invocation. The model may adjust flags. If you want a specific wpscan command executed verbatim without pipeline orchestration, run it from the shell instead of the REPL (`wpscan --url https://example.com --enumerate vp ...`), or use the mobile sibling `bughunter-harness-lite`, which exposes a `/run <cmd>` REPL slash-command for exactly this.
+> ```
+> > check if https://www.example.com exposes any of /.env, /.git/config, /backup.zip or /wp-config.php.bak
+> ```
+>
+> ```
+> > enumerate subdomains of example.com with subfinder and then run httpx against the top 5 live hosts to see title and tech
+> ```
+>
+> ```
+> > whois example.com, resolve A and CNAME records for www.example.com, and finish by running nuclei -id http-missing-security-headers against https://www.example.com
+> ```
+>
+> The REPL guard validates each line as a ≥4-word natural-language objective, resolves scope (from sticky `--scope` or auto-inferred from the target) and starts the pipeline. Each objective is distributed across the agents that actually own those tools: wpscan lives in `wordpress` (step 7), subfinder + httpx in `recon` (step 1) + `sub_prioritizer` (step 2), the path-exposure probes in `content_discovery` (step 4) and `web_vuln` (step 6), whois / dig / `nuclei -id` in `recon` + `fingerprint` (step 3). The model may adjust flags per agent. If you want a specific command executed verbatim without pipeline orchestration, run it from the shell instead of the REPL, or use the mobile sibling `bughunter-harness-lite`, which exposes a `/run <cmd>` REPL slash-command for exactly this.
 
 ![Bughunter Harness command-line interface — pipeline starting](images/application-command-line-interface.png)
 *Pipeline start — target and agent queue announced, first agents entering `RUNNING`.*
