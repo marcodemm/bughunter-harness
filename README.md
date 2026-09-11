@@ -8,6 +8,8 @@ Autonomous local-LLM pentest agent. Multi-agent orchestrated pipeline (recon →
 
 Read `harness.py --help` for the full flag reference.
 
+> **Mobile sibling**: for a single-process, agent-loop variant designed to run inside a Termux + Kali NetHunter chroot on Android (with Ollama serving a small 3B fine-tune), see **[marcodemm/bughunter-harness-lite](https://github.com/marcodemm/bughunter-harness-lite)**. Same security gates (scope allowlist, rate limit, secret redaction, pre-flight with the same fatal markers), much smaller toolbox (no `katana` / `gowitness` / `sqlmap` — those need too much on ARM chroot), a REPL for interactive quick-checks, and no multi-agent orchestrator. Use it for verifying a finding on the go, reacting to an OOB push, or chatting with your local model without spinning up the full 13-stage pipeline.
+
 ---
 
 ## Requirements
