@@ -192,6 +192,16 @@ Example:  --target https://www.example.com --scope *.example.com --top-hosts 3 -
 
 The REPL accepts a full CLI-style line — paste the same string you'd use with `python harness.py …` from bash, or use only the flags you want and let the sticky ones from previous sessions carry over. Sticky flags echo a `[+] X set (sticky): Y` line when they land; setting a flag without a target no longer prints the help block.
 
+> **Note — the `>` prompt is NOT a shell.** Anything you type that isn't a slash command (`/quit`, `/bye`, `/exit`) or a sticky-flag / CLI-style line (`--target …`, `--scope …`, `--header …`, `--top-hosts N`, etc.) is treated as the objective for the next agent pipeline. The orchestrator boots the 10-agent pipeline against the target parsed out of your input, and the individual agents' LLMs decide the tool calls from there (constrained by the security gates).
+>
+> **Example — ask the agent in natural language:**
+>
+> ```
+> > run wpscan against https://example.com with --enumerate vp -t 5 --disable-tls-checks --request-timeout 20 --connect-timeout 10 and report the plugins found
+> ```
+>
+> The REPL guard validates the line as a ≥4-word natural-language objective, resolves scope (from sticky `--scope` or auto-inferred from the target) and starts the pipeline. The `wordpress` agent (step 7) is where wpscan actually runs — its LLM sees your objective in `build_objective()` and decides the exact wpscan invocation. The model may adjust flags. If you want a specific wpscan command executed verbatim without pipeline orchestration, run it from the shell instead of the REPL (`wpscan --url https://example.com --enumerate vp ...`), or use the mobile sibling `bughunter-harness-lite`, which exposes a `/run <cmd>` REPL slash-command for exactly this.
+
 ![Bughunter Harness command-line interface — pipeline starting](images/application-command-line-interface.png)
 *Pipeline start — target and agent queue announced, first agents entering `RUNNING`.*
 
