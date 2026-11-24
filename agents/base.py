@@ -175,7 +175,7 @@ def _headers_reminder(custom_headers: dict[str, str]) -> str:
     concatenates with `; `). The old reminder only mentioned curl/nuclei/
     ffuf and the model would forget the header for other tools — regression
     seen in run 20260903T133821Z where wordpress agent ran wpscan WITHOUT
-    the required X-Grayback attribution header for the whole session.
+    the required X-Attribution header for the whole session.
     """
     if not custom_headers:
         return ""
@@ -214,6 +214,7 @@ def _headers_reminder(custom_headers: dict[str, str]) -> str:
     lines.append("Concrete examples:")
     lines.append(f'  curl -sI {dash_h} https://example.com/')
     lines.append(f'  nuclei -u https://example.com {dash_h} -tags cve -silent')
+    lines.append(f'  gobuster dir -u https://example.com -w <wordlist> {dash_h}')
     lines.append(f'  wpscan --url https://example.com --headers "{wpscan_headers}" '
                  f'--random-user-agent --no-banner')
     lines.append("")
@@ -475,7 +476,7 @@ class BaseAgent:
             max_iterations_run = max(3, self.MAX_ITERATIONS // 2)
         # N10 fix (2026-09-03): put the CUSTOM HEADERS reminder FIRST in
         # the system content, not last. In run 20260903T175056Z the LLM
-        # skipped the X-Grayback attribution header on 20/20 HTTP calls
+        # skipped the X-Attribution header on 20/20 HTTP calls
         # even though `_headers_reminder` correctly injected the block —
         # the reminder was at the end of a very long prompt (agent-specific
         # SYSTEM_PROMPT + FINISH_FORMAT_REMINDER first, headers last) so
